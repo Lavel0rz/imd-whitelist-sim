@@ -6,6 +6,7 @@ import base64
 import json
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from pathlib import Path
 
@@ -26,7 +27,7 @@ SEED_PREFIX = "imd1."
 # score uses staked FP per alive pet, shields at 6 FP each (2x) => 12 FP-eq per shield,
 # lootboxes at $1.50 each (2x) => 3 USD-eq; convert via FP USD price,
 # dice 0.5x, age 0.1x, stars 0.1x.
-# lifetimeFpBurned: 1.0 so each burned FP counts 1:1 in custom weight (FP units).
+# lifetimeFpBurned: 1.0 = Shroom-burn FP (catalog) counts 1:1 in custom weight.
 DEFAULT_MULT = {
     "stakedFp": 1.0,
     "shieldsPurchased": 12.0,  # 6 FP * 2x
@@ -58,8 +59,10 @@ def load_burns() -> dict:
     if not BURNS_JSON.exists():
         return {
             "source": GRAPHQL_URL,
-            "field": "pet.fpSpent",
+            "field": "consumeds.Shroom",
             "burns": {},
+            "mushroomFeeds": {},
+            "fpItemSpend": {},
             "missingBurnDataWallets": None,
         }
     with open(BURNS_JSON, encoding="utf-8") as f:
@@ -92,105 +95,151 @@ def _graphql(query: str, variables: dict | None = None, timeout: float = 90.0) -
     return payload
 
 
-def fetch_burns_for_whitelist(whitelist: dict, batch_size: int = 100) -> dict:
-    """Fetch pet.fpSpent from api.pet.game GraphQL and aggregate to wallet.
+def fetch_item_catalog() -> dict[int, dict]:
+    """Map itemId → {name, priceFp} from api.pet.game (price is FP wei / 1e18)."""
+    payload = _graphql("{ items(limit: 50) { items { id name price } } }")
+    items = (((payload.get("data") or {}).get("items") or {}).get("items")) or []
+    out: dict[int, dict] = {}
+    for it in items:
+        try:
+            iid = int(it["id"])
+            out[iid] = {
+                "name": str(it.get("name") or iid),
+                "priceFp": float(it.get("price") or 0) / 1e18,
+            }
+        except (TypeError, ValueError, KeyError):
+            continue
+    return out
 
-    `fpSpent` is lifetime FP spent per pet (wei, 18 decimals). Mushroom buys burn
-    100% of FP; this is the best public per-pet lifetime burn/spend signal.
+
+def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 16) -> dict:
+    """Estimate lifetime FP burned from real Shroom buy+burn activity (not pet.fpSpent).
+
+    Method (api.pet.game GraphQL `consumeds`):
+      - Count rows with giver=wallet, itemId=0 (Shroom), isSell=false
+      - lifetimeFpBurned = count × current catalog Shroom price (FP wei/1e18)
+      - Docs: FP used to buy mushrooms is 100% burned
+
+    Also estimates fpItemSpend ≈ burned + shieldsPurchased×shield list price (whitelist
+    field; shields are buy-for-spend, mostly not burned).
+
+    Caveat: catalog prices are current list FP; historical USD→FP sizes may differ.
+    pet.fpSpent is stake/principal and is intentionally unused.
     """
-    pet_ids: list[int] = []
-    for w in whitelist.get("wallets") or []:
-        for p in w.get("pets") or []:
-            try:
-                pet_ids.append(int(p["petId"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-    pet_ids = sorted(set(pet_ids))
+    catalog = fetch_item_catalog()
+    if 0 not in catalog:
+        raise RuntimeError("Shroom item (id=0) missing from api.pet.game catalog")
+    shroom_price = float(catalog[0]["priceFp"])
+    shield_price = float(catalog.get(6, {}).get("priceFp") or 6.0)
 
     query = """
-    query($ids: [Int!], $limit: Int!) {
-      pets(where: { id_in: $ids }, limit: $limit) {
-        items { id owner fpSpent }
-      }
+    query($g: String!) {
+      consumeds(where: { giver: $g, itemId: 0, isSell: false }) { totalCount }
     }
     """
-    by_pet: dict[int, dict] = {}
-    for i in range(0, len(pet_ids), batch_size):
-        chunk = pet_ids[i : i + batch_size]
-        if not chunk:
-            continue
-        payload = _graphql(query, {"ids": chunk, "limit": len(chunk)})
-        items = (((payload.get("data") or {}).get("pets") or {}).get("items")) or []
-        for it in items:
-            try:
-                pid = int(it["id"])
-                spent = float(it["fpSpent"]) / 1e18
-            except (KeyError, TypeError, ValueError):
-                continue
-            by_pet[pid] = {"owner": it.get("owner") or "", "fpSpent": spent}
 
-    wallet_totals: dict[str, float] = {}
-    for info in by_pet.values():
-        owner = info["owner"]
-        if not owner:
-            continue
-        wallet_totals[owner] = wallet_totals.get(owner, 0.0) + float(info["fpSpent"])
+    wallets = [str(w["wallet"]) for w in (whitelist.get("wallets") or [])]
+    shield_by_wallet = {
+        str(w["wallet"]): float(w.get("shieldsPurchased") or 0)
+        for w in (whitelist.get("wallets") or [])
+    }
+    lower_map = {a.lower(): a for a in wallets}
 
-    # Map onto whitelist wallet casing; missing wallets => 0
-    lower_map = {str(w["wallet"]).lower(): w["wallet"] for w in whitelist.get("wallets") or []}
     burns: dict[str, float] = {}
-    for owner, amt in wallet_totals.items():
-        key = lower_map.get(owner.lower(), owner)
-        burns[key] = round(float(amt), 6)
+    feeds: dict[str, int] = {}
+    spend: dict[str, float] = {}
+
+    def one(addr: str) -> tuple[str, int]:
+        payload = _graphql(query, {"g": addr}, timeout=45.0)
+        n = int((((payload.get("data") or {}).get("consumeds") or {}).get("totalCount")) or 0)
+        return addr, n
+
+    errors = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = [pool.submit(one, a) for a in wallets]
+        for fut in as_completed(futs):
+            try:
+                addr, shrooms = fut.result()
+            except Exception:
+                errors += 1
+                continue
+            key = lower_map.get(addr.lower(), addr)
+            feeds[key] = int(shrooms)
+            burned = float(shrooms) * shroom_price
+            burns[key] = round(burned, 6)
+            shields = float(shield_by_wallet.get(key) or shield_by_wallet.get(addr) or 0.0)
+            # Approximate buy-for-spend: mushroom burns + shield purchases at list FP
+            spend[key] = round(burned + shields * shield_price, 6)
 
     missing = 0
-    for w in whitelist.get("wallets") or []:
-        addr = w["wallet"]
+    for addr in wallets:
         if addr not in burns:
-            if addr not in burns:
-                burns[addr] = 0.0
-                missing += 1
+            burns[addr] = 0.0
+            feeds[addr] = 0
+            shields = float(shield_by_wallet.get(addr) or 0.0)
+            spend[addr] = round(shields * shield_price, 6)
+            missing += 1
 
+    nonzero = sum(1 for v in burns.values() if v > 0)
     return {
         "source": GRAPHQL_URL,
-        "field": "pet.fpSpent",
-        "unit": "FP (1e18 wei scaled)",
+        "method": "consumeds(giver,itemId=0 Shroom,isSell:false) × catalog list price FP",
+        "field": "consumeds.Shroom (itemId=0)",
+        "burnItemIds": [0],
+        "burnItemNames": ["Shroom"],
+        "unit": "FP (catalog list price)",
+        "shroomPriceFp": shroom_price,
+        "shieldPriceFp": shield_price,
+        "itemPricesFp": {str(i): catalog[i]["priceFp"] for i in sorted(catalog)},
+        "itemNames": {str(i): catalog[i]["name"] for i in sorted(catalog)},
         "note": (
-            "Aggregated pet.fpSpent from https://api.pet.game GraphQL. "
-            "FP used to buy mushrooms is 100% burned; fpSpent is the public lifetime spend field."
+            "lifetimeFpBurned = Shroom feed count × catalog Shroom FP price (100% burn per docs). "
+            "fpItemSpend ≈ burns + whitelist shieldsPurchased × shield list price (spend, not all burned). "
+            "NOT pet.fpSpent (stake/principal). Catalog prices are current; history may vary."
         ),
         "updatedAt": int(time.time()),
-        "petCount": len(by_pet),
         "walletCount": len(burns),
-        "matchedWhitelistWallets": len(whitelist.get("wallets") or []) - missing,
+        "walletsWithBurns": nonzero,
+        "matchedWhitelistWallets": len(wallets) - missing,
         "missingBurnDataWallets": missing,
+        "fetchErrors": errors,
         "burns": burns,
+        "mushroomFeeds": feeds,
+        "fpItemSpend": spend,
     }
 
 
-def wallets_df(data: dict, burns_map: dict[str, float] | None = None) -> pd.DataFrame:
-    burns_map = burns_map or {}
-    # Case-insensitive lookup
-    burns_lower = {str(k).lower(): float(v) for k, v in burns_map.items()}
+
+def _map_lookup(m: dict, addr: str, default=0.0):
+    if addr in m:
+        return m[addr]
+    lower = {str(k).lower(): v for k, v in m.items()}
+    return lower.get(str(addr).lower(), default)
+
+
+def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
+    burns_meta = burns_meta or {}
+    burns_map = burns_meta.get("burns") or {}
+    feeds_map = burns_meta.get("mushroomFeeds") or {}
+    spend_map = burns_meta.get("fpItemSpend") or {}
     rows = []
     for w in data.get("wallets", []):
         addr = w["wallet"]
-        burned = burns_map.get(addr)
-        if burned is None:
-            burned = burns_lower.get(str(addr).lower(), 0.0)
         rows.append(
             {
                 "wallet": addr,
                 "rank": w.get("rank"),
                 "score": float(w.get("score") or 0),
-                "stakedFp": float(w.get("stakedFp") or 0),
+                "stakedFp": float(w.get("stakedFp") or 0),  # staked principal — NOT burn
                 "shieldsPurchased": float(w.get("shieldsPurchased") or 0),
                 "lootboxesOpened": float(w.get("lootboxesOpened") or 0),
                 "diceGamesEntered": float(w.get("diceGamesEntered") or 0),
                 "longestPetAliveDays": float(w.get("longestPetAliveDays") or 0),
                 "stars": float(w.get("stars") or 0),
                 "alivePetCount": float(w.get("alivePetCount") or 0),
-                "lifetimeFpBurned": float(burned or 0),
+                "lifetimeFpBurned": float(_map_lookup(burns_map, addr, 0.0) or 0),
+                "mushroomFeeds": float(_map_lookup(feeds_map, addr, 0) or 0),
+                "fpItemSpend": float(_map_lookup(spend_map, addr, 0.0) or 0),
             }
         )
     df = pd.DataFrame(rows)
@@ -581,7 +630,7 @@ init_session_defaults()
 
 st.title("🐾 IMD Whitelist Distribution Simulator")
 st.caption(
-    f"Source: [{DATA_URL}]({DATA_URL}) · Burns: [{GRAPHQL_URL}]({GRAPHQL_URL}) `pet.fpSpent` · "
+    f"Source: [{DATA_URL}]({DATA_URL}) · Burns: [{GRAPHQL_URL}]({GRAPHQL_URL}) Shroom `consumeds` × list FP price (not `fpSpent`) · "
     "Simulation only — **not** an official airdrop. "
     "Score blurb: staked FP per alive pet; shields 6 FP × 2x; lootboxes $1.50 × 2x; "
     "dice 0.5x; age 0.1x; stars 0.1x. "
@@ -688,7 +737,7 @@ with st.sidebar:
             with st.spinner("Fetching whitelist…"):
                 remote = fetch_remote()
             save_local(remote)
-            with st.spinner("Fetching lifetime FP burned (GraphQL)…"):
+            with st.spinner("Fetching Shroom burns + item spend (GraphQL consumeds)…"):
                 burns_payload = fetch_burns_for_whitelist(remote)
             save_burns(burns_payload)
             st.session_state.data_version += 1
@@ -697,8 +746,9 @@ with st.sidebar:
             st.success(
                 f"Updated · {remote.get('walletCount')} wallets · "
                 f"alive pets {remote.get('alivePetCount')} · "
-                f"burns pets {burns_payload.get('petCount')} · "
-                f"missing burns {burns_payload.get('missingBurnDataWallets', 0)}"
+                f"burn wallets {burns_payload.get('walletsWithBurns')} · "
+                f"shroom price {burns_payload.get('shroomPriceFp')} FP · "
+                f"errors {burns_payload.get('fetchErrors', 0)}"
             )
             st.rerun()
         except requests.Timeout:
@@ -725,9 +775,8 @@ with st.sidebar:
     )
 
 burns_meta = load_burns()
-burns_map = burns_meta.get("burns") or {}
 
-df = wallets_df(data, burns_map)
+df = wallets_df(data, burns_meta)
 if df.empty:
     st.warning("No wallets in whitelist data.")
     st.stop()
@@ -749,16 +798,18 @@ burns_updated = burns_meta.get("updatedAt")
 meta_cols[4].metric("updatedAt (unix)", updated if updated is not None else "—")
 
 zero_burns = int((df["lifetimeFpBurned"] <= 0).sum())
-if not burns_map:
+if not (burns_meta.get("burns") or burns_meta.get("updatedAt")):
     st.warning(
         "No burn cache yet (`fp-burns.json`). Click **Refresh whitelist + burns** "
         "or treat lifetime FP burned as 0 for all wallets."
     )
-elif zero_burns:
+else:
     st.info(
-        f"Burn source: `{burns_meta.get('source')}` field `{burns_meta.get('field')}` "
-        f"(updatedAt={burns_updated}). "
-        f"{zero_burns} wallet(s) have 0 burned FP (missing or truly zero) — treated as 0 in weights."
+        f"Burn source: `{burns_meta.get('method') or burns_meta.get('field')}` "
+        f"(Shroom list price {burns_meta.get('shroomPriceFp')} FP; updatedAt={burns_updated}). "
+        f"{burns_meta.get('walletsWithBurns', len(df) - zero_burns)} wallets with burns; "
+        f"{zero_burns} at 0 — treated as 0. "
+        "True Shroom burns only — **not** `pet.fpSpent` (stake/principal)."
     )
 
 st.divider()
@@ -806,7 +857,7 @@ elif mode == "site_blend":
             step=0.1,
             format="%.4f",
             key="blend_burn_mult",
-            help="FP units from api.pet.game pet.fpSpent (aggregated per wallet).",
+            help="Shroom feeds × catalog FP price (100% burn). Not stake/fpSpent.",
         )
     st.session_state["saved_blend_score"] = float(blend_score)
     st.session_state["saved_blend_burn"] = float(blend_burn)
@@ -823,11 +874,12 @@ elif mode == "custom":
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         m_staked = st.number_input(
-            "stakedFp ×",
+            "stakedFp × (staked, not burn)",
             min_value=0.0,
             step=0.1,
             format="%.4f",
             key="mult_stakedFp",
+            help="Whitelist staked FP principal — not lifetime burn.",
         )
         m_shields = st.number_input(
             "shieldsPurchased ×",
@@ -875,7 +927,7 @@ elif mode == "custom":
             step=0.1,
             format="%.4f",
             key="mult_lifetimeFpBurned",
-            help="From api.pet.game GraphQL pet.fpSpent (wei→FP), summed per wallet.",
+            help="Shroom consumeds × list FP price. True burns only (item Shroom).",
         )
 
     lootbox_as_fp = st.checkbox(
@@ -950,7 +1002,7 @@ st.session_state["_prev_weight_mode"] = mode
 
 # Build allocation
 alloc = allocate(weights, float(total_pool), dist_method)
-out = df[["wallet", "rank", "score", "lifetimeFpBurned"]].copy()
+out = df[["wallet", "rank", "score", "lifetimeFpBurned", "mushroomFeeds", "fpItemSpend", "stakedFp"]].copy()
 out["weight"] = weights.values
 wsum = float(out["weight"].sum())
 out["weight_pct"] = (out["weight"] / wsum * 100.0) if wsum > 0 else 0.0
@@ -1033,6 +1085,8 @@ fig_bar = px.bar(
         "weight_pct": ":.3f",
         "pct_of_pool": ":.4f",
         "lifetimeFpBurned": ":.2f",
+        "mushroomFeeds": True,
+        "fpItemSpend": ":.2f",
         "imd": ":.2f",
         "label": False,
     },
@@ -1060,6 +1114,9 @@ display = out.copy()
 display["weight"] = display["weight"].map(lambda v: round(float(v), 6))
 display["weight_pct"] = display["weight_pct"].map(lambda v: round(float(v), 6))
 display["lifetimeFpBurned"] = display["lifetimeFpBurned"].map(lambda v: round(float(v), 6))
+display["mushroomFeeds"] = display["mushroomFeeds"].map(lambda v: int(float(v)))
+display["fpItemSpend"] = display["fpItemSpend"].map(lambda v: round(float(v), 6))
+display["stakedFp"] = display["stakedFp"].map(lambda v: round(float(v), 6))
 display["imd"] = display["imd"].map(lambda v: round(float(v), 6))
 display["pct_of_pool"] = display["pct_of_pool"].map(lambda v: round(float(v), 4))
 # Column order: put % of pool next to IMD
@@ -1104,16 +1161,16 @@ with st.expander("Compare alternate methods (same weights)"):
     st.dataframe(cmp.head(25), use_container_width=True)
 
 with st.expander("Top burners vs top score (glance)"):
-    glance = df[["wallet", "score", "lifetimeFpBurned"]].copy()
+    glance = df[["wallet", "score", "lifetimeFpBurned", "mushroomFeeds", "fpItemSpend", "stakedFp"]].copy()
     c_a, c_b = st.columns(2)
     with c_a:
-        st.markdown("**Top 10 by lifetime FP burned**")
+        st.markdown("**Top 10 by lifetime FP burned** (Shroom × list price)")
         st.dataframe(
             glance.sort_values("lifetimeFpBurned", ascending=False).head(10).reset_index(drop=True),
             use_container_width=True,
         )
     with c_b:
-        st.markdown("**Top 10 by site score**")
+        st.markdown("**Top 10 by site score** (stakedFp = stake, not burn)")
         st.dataframe(
             glance.sort_values("score", ascending=False).head(10).reset_index(drop=True),
             use_container_width=True,
