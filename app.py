@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import time
+import zlib
 from io import StringIO
 from pathlib import Path
 
@@ -18,6 +20,7 @@ LOCAL_JSON = Path(__file__).resolve().parent / "fp-whitelist.json"
 BURNS_JSON = Path(__file__).resolve().parent / "fp-burns.json"
 FALLBACK_JSON = Path("/workspace/fp-whitelist.json")
 DEFAULT_POOL = 300_000.0
+SEED_PREFIX = "imd1."
 
 # Site-ish defaults (from blurb):
 # score uses staked FP per alive pet, shields at 6 FP each (2x) => 12 FP-eq per shield,
@@ -33,6 +36,9 @@ DEFAULT_MULT = {
     "stars": 0.1,
     "lifetimeFpBurned": 1.0,
 }
+
+MODE_OPTIONS = ["site", "site_blend", "custom", "manual"]
+METHOD_OPTIONS = ["pro-rata", "sqrt", "equal"]
 
 
 def load_local() -> dict:
@@ -141,11 +147,6 @@ def fetch_burns_for_whitelist(whitelist: dict, batch_size: int = 100) -> dict:
     for w in whitelist.get("wallets") or []:
         addr = w["wallet"]
         if addr not in burns:
-            # Case-insensitive fallback
-            found = burns.get(lower_map.get(addr.lower(), ""), None)
-            if found is None and addr.lower() in {k.lower(): k for k in burns}:
-                # already keyed differently
-                pass
             if addr not in burns:
                 burns[addr] = 0.0
                 missing += 1
@@ -263,6 +264,156 @@ def short_addr(a: str) -> str:
     return f"{a[:6]}…{a[-4:]}"
 
 
+def data_fingerprint(data: dict) -> dict:
+    return {
+        "updatedAt": data.get("updatedAt"),
+        "walletCount": int(data.get("walletCount") or len(data.get("wallets") or [])),
+        "alivePetCount": data.get("alivePetCount"),
+    }
+
+
+def encode_seed(payload: dict) -> str:
+    """Deterministic portable seed: imd1. + base64url(zlib(json))."""
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    compressed = zlib.compress(raw, level=9)
+    token = base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+    return SEED_PREFIX + token
+
+
+def decode_seed(seed: str) -> dict:
+    s = (seed or "").strip()
+    if not s:
+        raise ValueError("Empty seed")
+    if s.startswith(SEED_PREFIX):
+        token = s[len(SEED_PREFIX) :]
+    else:
+        # allow bare base64url zlib blob
+        token = s
+    pad = "=" * (-len(token) % 4)
+    try:
+        compressed = base64.urlsafe_b64decode(token + pad)
+        raw = zlib.decompress(compressed)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"Invalid seed: {e}") from e
+    if not isinstance(payload, dict):
+        raise ValueError("Seed payload must be an object")
+    if int(payload.get("v", 0)) != 1:
+        raise ValueError(f"Unsupported seed version: {payload.get('v')}")
+    return payload
+
+
+def build_seed_payload(
+    *,
+    total_pool: float,
+    dist_method: str,
+    mode: str,
+    top_n: int,
+    mult: dict,
+    blend_score: float,
+    blend_burn: float,
+    lootbox_as_fp: bool,
+    fp_usd: float,
+    manual_map: dict[str, float] | None,
+    data: dict,
+) -> dict:
+    payload: dict = {
+        "v": 1,
+        "pool": float(total_pool),
+        "method": dist_method,
+        "mode": mode,
+        "top_n": int(top_n),
+        "data": data_fingerprint(data),
+    }
+    if mode == "site_blend":
+        payload["blend"] = {"score": float(blend_score), "burn": float(blend_burn)}
+    if mode == "custom":
+        payload["mult"] = {k: float(mult[k]) for k in DEFAULT_MULT}
+        payload["lootbox_as_fp"] = bool(lootbox_as_fp)
+        payload["fp_usd"] = float(fp_usd)
+    if mode == "manual":
+        # Full wallet→weight map (compact JSON; zlib keeps seed portable)
+        payload["manual"] = {str(k): float(v) for k, v in (manual_map or {}).items()}
+    return payload
+
+
+def apply_seed_to_session(payload: dict, wallets: list[str]) -> list[str]:
+    """Write seed knobs into session_state. Returns human warnings."""
+    warnings: list[str] = []
+    mode = payload.get("mode", "site")
+    if mode not in MODE_OPTIONS:
+        raise ValueError(f"Unknown mode: {mode}")
+    method = payload.get("method", "pro-rata")
+    if method not in METHOD_OPTIONS:
+        raise ValueError(f"Unknown method: {method}")
+
+    st.session_state["total_pool"] = float(payload.get("pool", DEFAULT_POOL))
+    st.session_state["dist_method"] = method
+    st.session_state["weight_mode"] = mode
+    st.session_state["top_n"] = int(payload.get("top_n", 15))
+
+    blend = payload.get("blend") or {}
+    st.session_state["blend_score_mult"] = float(blend.get("score", 1.0))
+    st.session_state["blend_burn_mult"] = float(blend.get("burn", 1.0))
+
+    mult = payload.get("mult") or {}
+    for k, default in DEFAULT_MULT.items():
+        st.session_state[f"mult_{k}"] = float(mult.get(k, default))
+    st.session_state["lootbox_as_fp"] = bool(payload.get("lootbox_as_fp", False))
+    st.session_state["fp_usd"] = float(payload.get("fp_usd", 1.0))
+
+    if mode == "manual":
+        manual = payload.get("manual") or {}
+        # Align to current wallet list; missing → 0
+        lower = {a.lower(): a for a in wallets}
+        rows = []
+        used = set()
+        for raw_addr, weight in manual.items():
+            key = lower.get(str(raw_addr).lower())
+            if key is None:
+                continue
+            rows.append({"wallet": key, "weight": float(weight)})
+            used.add(key)
+        for addr in wallets:
+            if addr not in used:
+                rows.append({"wallet": addr, "weight": 0.0})
+        st.session_state.manual_df = pd.DataFrame(rows)
+        st.session_state.data_version = int(st.session_state.get("data_version", 0)) + 1
+        missing = len(wallets) - len(used)
+        if missing:
+            warnings.append(
+                f"Manual seed covered {len(used)}/{len(wallets)} current wallets; "
+                f"{missing} missing set to 0."
+            )
+    return warnings
+
+
+def init_session_defaults() -> None:
+    defaults = {
+        "manual_df": None,
+        "data_version": 0,
+        "total_pool": float(DEFAULT_POOL),
+        "dist_method": "pro-rata",
+        "weight_mode": "site",
+        "top_n": 15,
+        "blend_score_mult": 1.0,
+        "blend_burn_mult": 1.0,
+        "lootbox_as_fp": False,
+        "fp_usd": 1.0,
+        "seed_load_input": "",
+        "seed_fingerprint_warn": None,
+        "seed_apply_warnings": [],
+        "_seed_url_consumed": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+    for k, v in DEFAULT_MULT.items():
+        sk = f"mult_{k}"
+        if sk not in st.session_state:
+            st.session_state[sk] = float(v)
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -273,19 +424,61 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+init_session_defaults()
+
 st.title("🐾 IMD Whitelist Distribution Simulator")
 st.caption(
     f"Source: [{DATA_URL}]({DATA_URL}) · Burns: [{GRAPHQL_URL}]({GRAPHQL_URL}) `pet.fpSpent` · "
     "Simulation only — **not** an official airdrop. "
     "Score blurb: staked FP per alive pet; shields 6 FP × 2x; lootboxes $1.50 × 2x; "
-    "dice 0.5x; age 0.1x; stars 0.1x."
+    "dice 0.5x; age 0.1x; stars 0.1x. "
+    "**Seeds lock the formula/knobs; whitelist/score snapshots may drift.**"
 )
 
-# Session state bootstrap
-if "manual_df" not in st.session_state:
-    st.session_state.manual_df = None
-if "data_version" not in st.session_state:
-    st.session_state.data_version = 0
+# Load whitelist early so seed apply can align manual maps
+try:
+    data = load_local()
+except Exception as e:
+    st.error(f"Failed to load local whitelist JSON: {e}")
+    st.stop()
+
+wallet_list = [w["wallet"] for w in data.get("wallets") or []]
+
+# Consume ?seed= once per session (or when newly present)
+try:
+    qp_seed = st.query_params.get("seed")
+except Exception:
+    qp_seed = None
+if isinstance(qp_seed, list):
+    qp_seed = qp_seed[0] if qp_seed else None
+if qp_seed and not st.session_state.get("_seed_url_consumed"):
+    st.session_state["_pending_seed"] = str(qp_seed)
+    st.session_state["_seed_url_consumed"] = True
+
+if st.session_state.get("_pending_seed"):
+    try:
+        payload = decode_seed(st.session_state["_pending_seed"])
+        warns = apply_seed_to_session(payload, wallet_list)
+        fp = payload.get("data") or {}
+        cur = data_fingerprint(data)
+        if fp and (
+            fp.get("updatedAt") != cur.get("updatedAt")
+            or int(fp.get("walletCount") or -1) != int(cur.get("walletCount") or -2)
+        ):
+            st.session_state["seed_fingerprint_warn"] = (
+                f"Seed data fingerprint differs from current whitelist "
+                f"(seed updatedAt={fp.get('updatedAt')}, wallets={fp.get('walletCount')}; "
+                f"now updatedAt={cur.get('updatedAt')}, wallets={cur.get('walletCount')}). "
+                "Knobs applied; IMD amounts may differ."
+            )
+        else:
+            st.session_state["seed_fingerprint_warn"] = None
+        st.session_state["seed_apply_warnings"] = warns
+        st.session_state["_pending_seed"] = None
+        st.toast("Seed applied", icon="🌱")
+    except ValueError as e:
+        st.session_state["_pending_seed"] = None
+        st.session_state["seed_fingerprint_warn"] = f"Could not load seed: {e}"
 
 # Sidebar: pool, method, refresh
 with st.sidebar:
@@ -293,22 +486,22 @@ with st.sidebar:
     total_pool = st.number_input(
         "Total IMD pool",
         min_value=0.0,
-        value=float(DEFAULT_POOL),
         step=1000.0,
         format="%.0f",
+        key="total_pool",
     )
     dist_method = st.selectbox(
         "Distribution method",
-        options=["pro-rata", "sqrt", "equal"],
+        options=METHOD_OPTIONS,
         format_func=lambda m: {
             "pro-rata": "Pro-rata (weight)",
             "sqrt": "Sqrt(weight)",
             "equal": "Equal split",
         }[m],
-        index=0,
+        key="dist_method",
         help="Primary allocation uses the selected method. Pro-rata is weight_i / sum(weights) × pool.",
     )
-    top_n = st.slider("Top N chart", min_value=5, max_value=50, value=15, step=1)
+    top_n = st.slider("Top N chart", min_value=5, max_value=50, step=1, key="top_n")
 
     st.divider()
     st.subheader("Data")
@@ -322,12 +515,14 @@ with st.sidebar:
             save_burns(burns_payload)
             st.session_state.data_version += 1
             st.session_state.manual_df = None
+            st.session_state["_seed_url_consumed"] = False
             st.success(
                 f"Updated · {remote.get('walletCount')} wallets · "
                 f"alive pets {remote.get('alivePetCount')} · "
                 f"burns pets {burns_payload.get('petCount')} · "
                 f"missing burns {burns_payload.get('missingBurnDataWallets', 0)}"
             )
+            st.rerun()
         except requests.Timeout:
             st.error("Request timed out. Local JSON unchanged.")
         except requests.RequestException as e:
@@ -335,11 +530,17 @@ with st.sidebar:
         except (OSError, json.JSONDecodeError, RuntimeError) as e:
             st.error(f"Could not save/parse data: {e}")
 
-try:
-    data = load_local()
-except Exception as e:
-    st.error(f"Failed to load local whitelist JSON: {e}")
-    st.stop()
+    st.divider()
+    st.subheader("Share seed")
+    st.caption(
+        "Seeds encode formula knobs (not RNG). "
+        "Same seed + same data ⇒ same allocation. "
+        "If whitelist scores change later, amounts can drift."
+    )
+    seed_in = st.text_area("Paste seed", key="seed_load_input", height=80, placeholder="imd1.…")
+    if st.button("Apply seed", use_container_width=True, type="primary"):
+        st.session_state["_pending_seed"] = seed_in
+        st.rerun()
 
 burns_meta = load_burns()
 burns_map = burns_meta.get("burns") or {}
@@ -348,6 +549,11 @@ df = wallets_df(data, burns_map)
 if df.empty:
     st.warning("No wallets in whitelist data.")
     st.stop()
+
+if st.session_state.get("seed_fingerprint_warn"):
+    st.warning(st.session_state["seed_fingerprint_warn"])
+for wmsg in st.session_state.get("seed_apply_warnings") or []:
+    st.info(wmsg)
 
 meta_cols = st.columns(5)
 meta_cols[0].metric("Wallets", int(data.get("walletCount") or len(df)))
@@ -375,7 +581,7 @@ st.divider()
 
 mode = st.radio(
     "Weight mode",
-    options=["site", "site_blend", "custom", "manual"],
+    options=MODE_OPTIONS,
     format_func=lambda m: {
         "site": "A. Site score",
         "site_blend": "A2. Site score + burns blend",
@@ -383,10 +589,16 @@ mode = st.radio(
         "manual": "C. Manual override table",
     }[m],
     horizontal=True,
-    index=0,
+    key="weight_mode",
 )
 
 weights = pd.Series(dtype=float)
+blend_score = float(st.session_state.get("blend_score_mult", 1.0))
+blend_burn = float(st.session_state.get("blend_burn_mult", 1.0))
+mult = {k: float(st.session_state.get(f"mult_{k}", DEFAULT_MULT[k])) for k in DEFAULT_MULT}
+lootbox_as_fp = bool(st.session_state.get("lootbox_as_fp", False))
+fp_usd = float(st.session_state.get("fp_usd", 1.0))
+manual_map: dict[str, float] | None = None
 
 if mode == "site":
     weights = df["score"].copy()
@@ -399,64 +611,69 @@ elif mode == "site_blend":
     )
     b1, b2 = st.columns(2)
     with b1:
-        score_mult = st.number_input("score ×", value=1.0, step=0.1, format="%.4f")
+        blend_score = st.number_input("score ×", step=0.1, format="%.4f", key="blend_score_mult")
     with b2:
-        burn_mult = st.number_input(
+        blend_burn = st.number_input(
             "lifetimeFpBurned ×",
-            value=1.0,
             step=0.1,
             format="%.4f",
+            key="blend_burn_mult",
             help="FP units from api.pet.game pet.fpSpent (aggregated per wallet).",
         )
-    weights = (df["score"] * float(score_mult) + df["lifetimeFpBurned"] * float(burn_mult)).clip(lower=0)
+    weights = (df["score"] * float(blend_score) + df["lifetimeFpBurned"] * float(blend_burn)).clip(lower=0)
 
 elif mode == "custom":
     st.markdown("Edit multipliers. Defaults approximate the site formula; burns default 1.0× FP.")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        m_staked = st.number_input("stakedFp ×", value=DEFAULT_MULT["stakedFp"], step=0.1, format="%.4f")
+        m_staked = st.number_input("stakedFp ×", step=0.1, format="%.4f", key="mult_stakedFp")
         m_shields = st.number_input(
             "shieldsPurchased ×",
-            value=DEFAULT_MULT["shieldsPurchased"],
             step=0.1,
             format="%.4f",
+            key="mult_shieldsPurchased",
             help="Site: 6 FP × 2x = 12",
         )
     with c2:
         m_loot = st.number_input(
             "lootboxesOpened ×",
-            value=DEFAULT_MULT["lootboxesOpened"],
             step=0.1,
             format="%.4f",
+            key="mult_lootboxesOpened",
             help="Site: $1.50 × 2x = 3 (USD face)",
         )
-        m_dice = st.number_input("diceGamesEntered ×", value=DEFAULT_MULT["diceGamesEntered"], step=0.1, format="%.4f")
+        m_dice = st.number_input(
+            "diceGamesEntered ×", step=0.1, format="%.4f", key="mult_diceGamesEntered"
+        )
     with c3:
         m_age = st.number_input(
             "longestPetAliveDays ×",
-            value=DEFAULT_MULT["longestPetAliveDays"],
             step=0.01,
             format="%.4f",
+            key="mult_longestPetAliveDays",
         )
-        m_stars = st.number_input("stars ×", value=DEFAULT_MULT["stars"], step=0.01, format="%.4f")
+        m_stars = st.number_input("stars ×", step=0.01, format="%.4f", key="mult_stars")
     with c4:
         m_burn = st.number_input(
             "lifetimeFpBurned ×",
-            value=DEFAULT_MULT["lifetimeFpBurned"],
             step=0.1,
             format="%.4f",
+            key="mult_lifetimeFpBurned",
             help="From api.pet.game GraphQL pet.fpSpent (wei→FP), summed per wallet.",
         )
 
     lootbox_as_fp = st.checkbox(
         "Convert lootbox USD face → FP using FP USD price",
-        value=False,
+        key="lootbox_as_fp",
         help="If on, loot contribution = lootboxes × (loot_mult / FP_USD). "
         "If off, loot_mult is applied raw (default 3 ≈ $1.50×2).",
     )
     fp_usd = 1.0
     if lootbox_as_fp:
-        fp_usd = st.number_input("FP price (USD)", min_value=1e-9, value=1.0, step=0.01, format="%.6f")
+        fp_usd = st.number_input("FP price (USD)", min_value=1e-9, step=0.01, format="%.6f", key="fp_usd")
+    else:
+        # keep key stable even when hidden
+        fp_usd = float(st.session_state.get("fp_usd", 1.0))
 
     mult = {
         "stakedFp": m_staked,
@@ -475,7 +692,11 @@ else:  # manual
     reset_site = rc1.button("Reset from Site score", use_container_width=True)
     reset_custom = rc2.button("Reset from Custom defaults", use_container_width=True)
 
-    if reset_site or st.session_state.manual_df is None:
+    if reset_site:
+        base = df[["wallet", "score"]].rename(columns={"score": "weight"}).copy()
+        st.session_state.manual_df = base
+        st.session_state.data_version = int(st.session_state.get("data_version", 0)) + 1
+    elif st.session_state.manual_df is None:
         base = df[["wallet", "score"]].rename(columns={"score": "weight"}).copy()
         st.session_state.manual_df = base
     if reset_custom:
@@ -497,6 +718,7 @@ else:  # manual
     st.session_state.manual_df = edited
     merged = df[["wallet"]].merge(edited[["wallet", "weight"]], on="wallet", how="left")
     weights = merged["weight"].fillna(0.0)
+    manual_map = {str(r.wallet): float(r.weight) for r in edited.itertuples(index=False)}
 
 # Build allocation
 alloc = allocate(weights, float(total_pool), dist_method)
@@ -508,6 +730,49 @@ out["imd"] = alloc.values
 pool = float(total_pool)
 out["pct_of_pool"] = (out["imd"] / pool * 100.0) if pool > 0 else 0.0
 out = out.sort_values("imd", ascending=False).reset_index(drop=True)
+
+# Current shareable seed (formula knobs + optional data fingerprint)
+seed_payload = build_seed_payload(
+    total_pool=float(total_pool),
+    dist_method=str(dist_method),
+    mode=str(mode),
+    top_n=int(top_n),
+    mult=mult,
+    blend_score=float(blend_score),
+    blend_burn=float(blend_burn),
+    lootbox_as_fp=bool(lootbox_as_fp),
+    fp_usd=float(fp_usd),
+    manual_map=manual_map,
+    data=data,
+)
+current_seed = encode_seed(seed_payload)
+
+with st.expander("🌱 Shareable seed (Copy / URL)", expanded=False):
+    st.markdown(
+        "Copy this seed and send it to someone — they paste it under **Share seed → Apply seed** "
+        "(sidebar), or open `?seed=…` on the app URL. "
+        "The seed **locks the formula** (pool, mode, method, multipliers / manual weights). "
+        "It does **not** freeze whitelist scores; if data refreshes, IMD can change slightly."
+    )
+    st.code(current_seed, language=None)
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.download_button(
+            "📋 Download seed.txt",
+            data=current_seed + "\n",
+            file_name="imd_distribution_seed.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+    with sc2:
+        if st.button("🔗 Put seed in URL (?seed=)", use_container_width=True):
+            st.query_params["seed"] = current_seed
+            st.success("URL query param `seed` updated — copy the browser address bar to share.")
+    st.caption(
+        f"Fingerprint in seed: updatedAt={seed_payload['data'].get('updatedAt')}, "
+        f"wallets={seed_payload['data'].get('walletCount')}, "
+        f"alivePets={seed_payload['data'].get('alivePetCount')} · length={len(current_seed)} chars"
+    )
 
 # Summary metrics
 st.subheader("Summary")

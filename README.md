@@ -33,6 +33,7 @@ Then open http://localhost:8501 (or the host URL if remote).
 - Summary metrics (Gini, HHI, top-10 share, min/median/max)
 - Top-N chart, full allocation table, histogram, CSV download
 - Refresh button re-fetches whitelist **and** lifetime FP burned (`fp-burns.json` sidecar)
+- **Shareable seeds** (`imd1.` + zlib/base64url JSON): copy/load formula knobs; optional `?seed=` URL. Seeds lock the formula; whitelist data may drift.
 - Burns source: GraphQL `https://api.pet.game` field `pet.fpSpent` (wei→FP), aggregated per wallet from whitelist pet IDs. Missing wallets treated as 0.
 
 ## Verify allocation math
