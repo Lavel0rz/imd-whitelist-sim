@@ -337,6 +337,85 @@ def build_seed_payload(
     return payload
 
 
+def widget_state_keys() -> list[str]:
+    return [
+        "total_pool",
+        "dist_method",
+        "weight_mode",
+        "top_n",
+        "blend_score_mult",
+        "blend_burn_mult",
+        "lootbox_as_fp",
+        "fp_usd",
+        *[f"mult_{k}" for k in DEFAULT_MULT],
+    ]
+
+
+def _set_widget_value(key: str, value) -> None:
+    """Assign a widget-backed session key.
+
+    Streamlit can ignore in-place overwrites of existing widget keys in some
+    cases; deleting first makes the next widget instantiation pick up `value`.
+    Must run *before* the keyed widget is rendered in this script run.
+    """
+    if key in st.session_state:
+        del st.session_state[key]
+    st.session_state[key] = value
+
+
+def current_knob_snapshot() -> dict:
+    return {
+        "pool": float(st.session_state.get("total_pool", DEFAULT_POOL)),
+        "method": st.session_state.get("dist_method", "pro-rata"),
+        "mode": st.session_state.get("weight_mode", "site"),
+        "top_n": int(st.session_state.get("top_n", 15)),
+        "blend_score": float(st.session_state.get("blend_score_mult", 1.0)),
+        "blend_burn": float(st.session_state.get("blend_burn_mult", 1.0)),
+        "lootbox_as_fp": bool(st.session_state.get("lootbox_as_fp", False)),
+        "fp_usd": float(st.session_state.get("fp_usd", 1.0)),
+        "mult": {k: float(st.session_state.get(f"mult_{k}", DEFAULT_MULT[k])) for k in DEFAULT_MULT},
+    }
+
+
+def seed_knob_snapshot(payload: dict) -> dict:
+    blend = payload.get("blend") or {}
+    mult = payload.get("mult") or {}
+    return {
+        "pool": float(payload.get("pool", DEFAULT_POOL)),
+        "method": payload.get("method", "pro-rata"),
+        "mode": payload.get("mode", "site"),
+        "top_n": int(payload.get("top_n", 15)),
+        "blend_score": float(blend.get("score", 1.0)),
+        "blend_burn": float(blend.get("burn", 1.0)),
+        "lootbox_as_fp": bool(payload.get("lootbox_as_fp", False)),
+        "fp_usd": float(payload.get("fp_usd", 1.0)),
+        "mult": {k: float(mult.get(k, DEFAULT_MULT[k])) for k in DEFAULT_MULT},
+    }
+
+
+def format_knob_summary(snap: dict) -> str:
+    parts = [
+        f"mode=`{snap['mode']}`",
+        f"method=`{snap['method']}`",
+        f"pool={snap['pool']:g}",
+        f"top_n={snap['top_n']}",
+    ]
+    if snap["mode"] == "site_blend":
+        parts.append(f"blend score×{snap['blend_score']:g} burn×{snap['blend_burn']:g}")
+    if snap["mode"] == "custom":
+        m = snap["mult"]
+        parts.append(
+            "mult("
+            + ", ".join(f"{k}={m[k]:g}" for k in DEFAULT_MULT)
+            + ")"
+        )
+        if snap["lootbox_as_fp"]:
+            parts.append(f"lootbox→FP @ ${snap['fp_usd']:g}")
+    if snap["mode"] == "manual":
+        parts.append("manual weights")
+    return " · ".join(parts)
+
+
 def apply_seed_to_session(payload: dict, wallets: list[str]) -> list[str]:
     """Write seed knobs into session_state. Returns human warnings."""
     warnings: list[str] = []
@@ -347,20 +426,20 @@ def apply_seed_to_session(payload: dict, wallets: list[str]) -> list[str]:
     if method not in METHOD_OPTIONS:
         raise ValueError(f"Unknown method: {method}")
 
-    st.session_state["total_pool"] = float(payload.get("pool", DEFAULT_POOL))
-    st.session_state["dist_method"] = method
-    st.session_state["weight_mode"] = mode
-    st.session_state["top_n"] = int(payload.get("top_n", 15))
+    _set_widget_value("total_pool", float(payload.get("pool", DEFAULT_POOL)))
+    _set_widget_value("dist_method", method)
+    _set_widget_value("weight_mode", mode)
+    _set_widget_value("top_n", int(payload.get("top_n", 15)))
 
     blend = payload.get("blend") or {}
-    st.session_state["blend_score_mult"] = float(blend.get("score", 1.0))
-    st.session_state["blend_burn_mult"] = float(blend.get("burn", 1.0))
+    _set_widget_value("blend_score_mult", float(blend.get("score", 1.0)))
+    _set_widget_value("blend_burn_mult", float(blend.get("burn", 1.0)))
 
     mult = payload.get("mult") or {}
     for k, default in DEFAULT_MULT.items():
-        st.session_state[f"mult_{k}"] = float(mult.get(k, default))
-    st.session_state["lootbox_as_fp"] = bool(payload.get("lootbox_as_fp", False))
-    st.session_state["fp_usd"] = float(payload.get("fp_usd", 1.0))
+        _set_widget_value(f"mult_{k}", float(mult.get(k, default)))
+    _set_widget_value("lootbox_as_fp", bool(payload.get("lootbox_as_fp", False)))
+    _set_widget_value("fp_usd", float(payload.get("fp_usd", 1.0)))
 
     if mode == "manual":
         manual = payload.get("manual") or {}
@@ -388,6 +467,11 @@ def apply_seed_to_session(payload: dict, wallets: list[str]) -> list[str]:
     return warnings
 
 
+def queue_seed_from_input() -> None:
+    """Button callback: queue pasted seed for apply on the next run (before widgets)."""
+    st.session_state["_pending_seed"] = st.session_state.get("seed_load_input") or ""
+
+
 def init_session_defaults() -> None:
     defaults = {
         "manual_df": None,
@@ -403,6 +487,7 @@ def init_session_defaults() -> None:
         "seed_load_input": "",
         "seed_fingerprint_warn": None,
         "seed_apply_warnings": [],
+        "seed_apply_banner": None,
         "_seed_url_consumed": False,
     }
     for k, v in defaults.items():
@@ -455,9 +540,16 @@ if qp_seed and not st.session_state.get("_seed_url_consumed"):
     st.session_state["_pending_seed"] = str(qp_seed)
     st.session_state["_seed_url_consumed"] = True
 
-if st.session_state.get("_pending_seed"):
+if st.session_state.get("_pending_seed") is not None:
+    raw_seed = st.session_state.get("_pending_seed")
+    # Clear immediately to avoid loops if we rerun after apply.
+    st.session_state["_pending_seed"] = None
     try:
-        payload = decode_seed(st.session_state["_pending_seed"])
+        if not str(raw_seed or "").strip():
+            raise ValueError("Paste an imd1.… seed first")
+        before = current_knob_snapshot()
+        payload = decode_seed(str(raw_seed))
+        after = seed_knob_snapshot(payload)
         warns = apply_seed_to_session(payload, wallet_list)
         fp = payload.get("data") or {}
         cur = data_fingerprint(data)
@@ -474,11 +566,29 @@ if st.session_state.get("_pending_seed"):
         else:
             st.session_state["seed_fingerprint_warn"] = None
         st.session_state["seed_apply_warnings"] = warns
-        st.session_state["_pending_seed"] = None
-        st.toast("Seed applied", icon="🌱")
+        same = before == after and payload.get("mode") != "manual"
+        defaultish = (
+            after["mode"] == "site"
+            and after["method"] == "pro-rata"
+            and float(after["pool"]) == float(DEFAULT_POOL)
+            and int(after["top_n"]) == 15
+        )
+        summary = format_knob_summary(after)
+        if same and defaultish:
+            banner = (
+                f"Seed applied — knobs already matched defaults "
+                f"({summary}). UI/allocation look unchanged; that is expected."
+            )
+        elif same:
+            banner = f"Seed applied — knobs already matched current UI ({summary})."
+        else:
+            banner = f"Seed applied — {summary}"
+        st.session_state["seed_apply_banner"] = banner
+        # Rerun so keyed widgets instantiate against the new session_state values.
+        st.rerun()
     except ValueError as e:
-        st.session_state["_pending_seed"] = None
         st.session_state["seed_fingerprint_warn"] = f"Could not load seed: {e}"
+        st.session_state["seed_apply_banner"] = None
 
 # Sidebar: pool, method, refresh
 with st.sidebar:
@@ -537,10 +647,14 @@ with st.sidebar:
         "Same seed + same data ⇒ same allocation. "
         "If whitelist scores change later, amounts can drift."
     )
-    seed_in = st.text_area("Paste seed", key="seed_load_input", height=80, placeholder="imd1.…")
-    if st.button("Apply seed", use_container_width=True, type="primary"):
-        st.session_state["_pending_seed"] = seed_in
-        st.rerun()
+    st.text_area("Paste seed", key="seed_load_input", height=80, placeholder="imd1.…")
+    st.button(
+        "Apply seed",
+        use_container_width=True,
+        type="primary",
+        on_click=queue_seed_from_input,
+        help="Loads formula knobs from the seed (before widgets render on the next run).",
+    )
 
 burns_meta = load_burns()
 burns_map = burns_meta.get("burns") or {}
@@ -550,6 +664,8 @@ if df.empty:
     st.warning("No wallets in whitelist data.")
     st.stop()
 
+if st.session_state.get("seed_apply_banner"):
+    st.success(st.session_state["seed_apply_banner"])
 if st.session_state.get("seed_fingerprint_warn"):
     st.warning(st.session_state["seed_fingerprint_warn"])
 for wmsg in st.session_state.get("seed_apply_warnings") or []:
