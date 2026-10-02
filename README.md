@@ -34,7 +34,7 @@ Then open http://localhost:8501 (or the host URL if remote).
 - Top-N chart, full allocation table, histogram, CSV download
 - Refresh button re-fetches whitelist **and** lifetime FP burned (`fp-burns.json` sidecar)
 - **Shareable seeds** (`imd1.` + zlib/base64url JSON): copy/load formula knobs; optional `?seed=` URL. Seeds lock the formula; whitelist data may drift.
-- Burns source: GraphQL `https://api.pet.game` **`consumeds`** where item=**Shroom** (itemId 0), `isSell:false`, × catalog list price in FP (docs: mushrooms 100% burned). **Not** `pet.fpSpent` (stake). Also caches `mushroomFeeds` + `fpItemSpend` (all items × list price). Missing → 0. Caveat: current catalog prices.
+- Burns source: GraphQL `consumeds` (all shop items except upgrade stake 1–5) × list FP + dice×0.2 FP + lootboxes×($2/FP_USD) + passes×($15/FP_USD). Treated as `lifetimeFpBurned`. Breakdown in `fp-burns.json`. **Not** `pet.fpSpent`/stakedFp. Caveat: catalog & FP_USD snapshots.
 
 ## Verify allocation math
 
