@@ -35,6 +35,7 @@ Then open http://localhost:8501 (or the host URL if remote).
 - Refresh button re-fetches whitelist **and** lifetime FP burned (`fp-burns.json` sidecar)
 - **Shareable seeds** (`imd1.` + zlib/base64url JSON): copy/load formula knobs; optional `?seed=` URL. Seeds lock the formula; whitelist data may drift.
 - Burns source: GraphQL `consumeds` (all shop items except upgrade stake 1–5) × list FP + dice×0.2 FP + lootboxes×($2/FP_USD) + passes×($15/FP_USD). Treated as `lifetimeFpBurned`. Breakdown in `fp-burns.json`. **Not** `pet.fpSpent`/stakedFp. Caveat: catalog & FP_USD snapshots.
+- **Historical foods (beer/apple/tea/…):** secondary guides (Odaily Nov 2023) list V1-era foods (beer 50 FP, etc.). On `api.pet.game`, every `isSell:false` consumed maps to catalog itemIds **0–21** only (no orphan ids; no Beer/Apple/Tea item names). Those V1 foods are **not** includable from this API without inventing itemId↔price maps, so they are not added to the burn sum. Fetch scans itemIds 0–64 and records any future unpriced ids in `fp-burns.json` (`unpricedItemIds` / `unpricedGlobalBuys`).
 
 ## Verify allocation math
 

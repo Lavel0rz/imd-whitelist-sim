@@ -127,6 +127,32 @@ STAKE_ITEM_IDS = frozenset({1, 2, 3, 4, 5})
 DICE_JOIN_FP = 0.2
 PASS_USD = 15.0  # in-game "Pass for $15"
 LOOT_USD = 2.0  # docs.frenpet.xyz lootbox spin
+# Scan beyond current catalog so retired/unknown shop itemIds are not silently dropped.
+CONSUMED_ITEM_ID_SCAN_MAX = 64
+# Hardcoded legacy FP list prices for itemIds missing from today's catalog.
+# Investigation (2026-10-02): api.pet.game consumeds has ZERO buys outside itemIds 0–21,
+# and no Beer/Apple/Tea/Bath/Mushroom names in `items`. V1 foods (Odaily/Paragraph @ 50 FP
+# beer etc.) are not present as distinct itemIds here — do not invent mappings.
+LEGACY_ITEM_PRICES_FP: dict[int, tuple[str, float]] = {
+    # e.g. 22: ("Beer", 50.0),  # only with evidenced itemId + price
+}
+
+
+def discover_consumed_item_ids(scan_max: int = CONSUMED_ITEM_ID_SCAN_MAX) -> dict[int, int]:
+    """Global isSell=false consumeds counts for itemId 0..scan_max (chunked queries)."""
+    out: dict[int, int] = {}
+    chunk = 8
+    for start in range(0, scan_max + 1, chunk):
+        ids = list(range(start, min(start + chunk, scan_max + 1)))
+        bits = [
+            f"i{i}: consumeds(where: {{itemId: {i}, isSell: false}}) {{ totalCount }}"
+            for i in ids
+        ]
+        payload = _graphql("{ " + " ".join(bits) + " }")
+        data = payload.get("data") or {}
+        for i in ids:
+            out[i] = int((data.get(f"i{i}") or {}).get("totalCount") or 0)
+    return out
 
 
 def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
@@ -142,13 +168,26 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
     Excluded: pet.fpSpent / whitelist stakedFp; upgrade items 1–5 (stake path);
     free wheel spins / gacha (no FP cost in docs).
 
+    Unknown itemIds (buys outside catalog, no LEGACY_ITEM_PRICES_FP entry) are counted
+    in breakdown.unpricedItemCounts but not added to lifetimeFpBurned.
+
     Julio policy: weigh all such spend as burned FP for IMD sim purposes.
     """
     catalog = fetch_item_catalog()
     if not catalog:
         raise RuntimeError("Empty item catalog from api.pet.game")
+    global_buys = discover_consumed_item_ids()
+    # Price map: current catalog, then evidenced legacy overrides for missing ids only.
+    prices: dict[int, dict] = {iid: dict(meta) for iid, meta in catalog.items()}
+    for iid, (name, price_fp) in LEGACY_ITEM_PRICES_FP.items():
+        if iid not in prices:
+            prices[iid] = {"name": name, "priceFp": float(price_fp), "legacy": True}
+    active_ids = sorted(
+        {i for i, n in global_buys.items() if n > 0} | set(catalog.keys()) | set(LEGACY_ITEM_PRICES_FP)
+    )
+    unpriced_ids = sorted(i for i in active_ids if i not in prices)
     fp_usd = max(fetch_fp_usd_price(), 1e-12)
-    item_ids = sorted(catalog.keys())
+    item_ids = active_ids
     pass_fp = PASS_USD / fp_usd
     loot_fp = LOOT_USD / fp_usd
 
@@ -193,12 +232,17 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
         shop_burn = 0.0
         shop_stake = 0.0
         by_name: dict[str, float] = {}
+        unpriced: dict[str, int] = {}
         for iid, cnt in counts.items():
             if cnt <= 0:
                 continue
-            fp = cnt * float(catalog[iid]["priceFp"])
-            name = catalog[iid]["name"]
-            by_name[name] = round(fp, 6)
+            meta = prices.get(iid)
+            if meta is None:
+                unpriced[str(iid)] = cnt
+                continue
+            fp = cnt * float(meta["priceFp"])
+            name = str(meta["name"])
+            by_name[name] = round(by_name.get(name, 0.0) + fp, 6)
             if iid in STAKE_ITEM_IDS:
                 shop_stake += fp
             else:
@@ -220,6 +264,7 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
             "passesBought": passes,
             "mushroomFeeds": int(counts.get(0, 0)),
             "byItemFp": by_name,
+            "unpricedItemCounts": unpriced,
             "totalBurnFp": round(total, 6),
         }
         return addr, {"counts": counts, "detail": detail, "total": total}
@@ -259,6 +304,12 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
             missing += 1
 
     nonzero = sum(1 for v in burns.values() if v > 0)
+    unpriced_global = {str(i): global_buys[i] for i in unpriced_ids if global_buys.get(i, 0) > 0}
+    unpriced_wallet_hits = sum(
+        1
+        for d in breakdown.values()
+        if (d.get("unpricedItemCounts") or {})
+    )
     return {
         "source": GRAPHQL_URL,
         "method": (
@@ -266,23 +317,34 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
             f"dice×{DICE_JOIN_FP} + loot×(${LOOT_USD}/FP_USD) + pass×(${PASS_USD}/FP_USD)"
         ),
         "field": "consumeds[*]+dice+loot+pass",
-        "burnItemIds": [i for i in sorted(catalog) if i not in STAKE_ITEM_IDS],
+        "burnItemIds": [i for i in sorted(prices) if i not in STAKE_ITEM_IDS],
         "stakeItemIds": sorted(STAKE_ITEM_IDS),
+        "scannedItemIds": item_ids,
+        "globalConsumedBuysByItemId": {str(i): global_buys[i] for i in sorted(global_buys) if global_buys[i] > 0},
+        "unpricedItemIds": unpriced_ids,
+        "unpricedGlobalBuys": unpriced_global,
+        "walletsWithUnpricedItems": unpriced_wallet_hits,
+        "legacyItemPricesFp": {
+            str(i): {"name": n, "priceFp": p} for i, (n, p) in LEGACY_ITEM_PRICES_FP.items()
+        },
         "unit": "FP (catalog list price + USD/FP for loot/pass)",
         "fpUsd": fp_usd,
         "diceJoinFp": DICE_JOIN_FP,
         "passUsd": PASS_USD,
         "lootUsd": LOOT_USD,
-        "shroomPriceFp": float(catalog.get(0, {}).get("priceFp") or 0),
-        "shieldPriceFp": float(catalog.get(6, {}).get("priceFp") or 6),
-        "itemPricesFp": {str(i): catalog[i]["priceFp"] for i in sorted(catalog)},
-        "itemNames": {str(i): catalog[i]["name"] for i in sorted(catalog)},
+        "shroomPriceFp": float(prices.get(0, {}).get("priceFp") or 0),
+        "shieldPriceFp": float(prices.get(6, {}).get("priceFp") or 6),
+        "itemPricesFp": {str(i): prices[i]["priceFp"] for i in sorted(prices)},
+        "itemNames": {str(i): prices[i]["name"] for i in sorted(prices)},
         "note": (
             "lifetimeFpBurned sums Shroom/shields/insurance/cosmetics shop buys (list FP), "
             "dice (0.2 FP), lootboxes ($2/FP_USD), passes ($15/FP_USD). "
             "Upgrade items 1–5 excluded (stake). NOT pet.fpSpent / stakedFp. "
             "Catalog & FP_USD are snapshots; historical costs may differ. "
-            "Wheel/gacha treated as free (no FP in docs)."
+            "Wheel/gacha treated as free (no FP in docs). "
+            "Scans consumeds itemIds 0–"
+            f"{CONSUMED_ITEM_ID_SCAN_MAX}; unknown ids listed in unpriced* (not summed). "
+            "V1 foods (beer/apple/tea/…) are not distinct itemIds in api.pet.game."
         ),
         "updatedAt": int(time.time()),
         "walletCount": len(burns),
