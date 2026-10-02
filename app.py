@@ -363,6 +363,47 @@ def _set_widget_value(key: str, value) -> None:
     st.session_state[key] = value
 
 
+def ensure_saved_mult() -> dict[str, float]:
+    """Return a complete saved_mult dict (DEFAULT_MULT keys), repairing all-zero wipes."""
+    saved_raw = st.session_state.get("saved_mult") or {}
+    saved: dict[str, float] = {}
+    for k, default in DEFAULT_MULT.items():
+        try:
+            saved[k] = float(saved_raw[k]) if k in saved_raw else float(default)
+        except (TypeError, ValueError):
+            saved[k] = float(default)
+    if all(v == 0.0 for v in saved.values()) and any(float(v) != 0.0 for v in DEFAULT_MULT.values()):
+        saved = {k: float(v) for k, v in DEFAULT_MULT.items()}
+    st.session_state["saved_mult"] = saved
+    return saved
+
+
+def hydrate_custom_mult_widgets(*, force: bool = False) -> None:
+    """Copy saved_mult → mult_* keys only when missing or force (enter Custom / seed).
+
+    Never call with force=True on ordinary reruns after the user edits a number_input —
+    that snaps edits back to saved/defaults.
+    """
+    saved = ensure_saved_mult()
+    for k, val in saved.items():
+        sk = f"mult_{k}"
+        if force or sk not in st.session_state:
+            st.session_state[sk] = float(val)
+    if force or "lootbox_as_fp" not in st.session_state:
+        st.session_state["lootbox_as_fp"] = bool(st.session_state.get("saved_lootbox_as_fp", False))
+    if force or "fp_usd" not in st.session_state:
+        st.session_state["fp_usd"] = float(st.session_state.get("saved_fp_usd", 1.0))
+
+
+def hydrate_blend_widgets(*, force: bool = False) -> None:
+    bs = float(st.session_state.get("saved_blend_score", 1.0))
+    bb = float(st.session_state.get("saved_blend_burn", 1.0))
+    if force or "blend_score_mult" not in st.session_state:
+        st.session_state["blend_score_mult"] = bs
+    if force or "blend_burn_mult" not in st.session_state:
+        st.session_state["blend_burn_mult"] = bb
+
+
 def current_knob_snapshot() -> dict:
     return {
         "pool": float(st.session_state.get("total_pool", DEFAULT_POOL)),
@@ -452,6 +493,9 @@ def apply_seed_to_session(payload: dict, wallets: list[str]) -> list[str]:
     _set_widget_value("fp_usd", float(payload.get("fp_usd", 1.0)))
     st.session_state["saved_lootbox_as_fp"] = bool(payload.get("lootbox_as_fp", False))
     st.session_state["saved_fp_usd"] = float(payload.get("fp_usd", 1.0))
+    # Next Custom/blend paint should re-hydrate widget keys from saved_* once.
+    st.session_state["_hydrate_custom_mult"] = True
+    st.session_state["_hydrate_blend"] = True
 
     if mode == "manual":
         manual = payload.get("manual") or {}
@@ -506,6 +550,9 @@ def init_session_defaults() -> None:
         "saved_fp_usd": 1.0,
         "saved_blend_score": 1.0,
         "saved_blend_burn": 1.0,
+        "_prev_weight_mode": None,
+        "_hydrate_custom_mult": False,
+        "_hydrate_blend": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -746,16 +793,9 @@ elif mode == "site_blend":
         "Blend Analytica site score with lifetime FP burned. "
         "`weight = score × scoreMult + lifetimeFpBurned × burnMult`."
     )
-    # Same teardown issue as custom multipliers — restore from saved_* first.
-    if "blend_score_mult" not in st.session_state:
-        st.session_state["blend_score_mult"] = float(st.session_state.get("saved_blend_score", 1.0))
-    if "blend_burn_mult" not in st.session_state:
-        st.session_state["blend_burn_mult"] = float(st.session_state.get("saved_blend_burn", 1.0))
-    # If keys exist but were wiped to 0 while defaults are 1, restore saved
-    if float(st.session_state.get("blend_score_mult", 0)) == 0.0 and float(st.session_state.get("saved_blend_score", 1.0)) != 0.0:
-        st.session_state["blend_score_mult"] = float(st.session_state.get("saved_blend_score", 1.0))
-    if float(st.session_state.get("blend_burn_mult", 0)) == 0.0 and float(st.session_state.get("saved_blend_burn", 1.0)) != 0.0:
-        st.session_state["blend_burn_mult"] = float(st.session_state.get("saved_blend_burn", 1.0))
+    entering_blend = st.session_state.get("_prev_weight_mode") != "site_blend"
+    force_blend = entering_blend or bool(st.session_state.pop("_hydrate_blend", False))
+    hydrate_blend_widgets(force=force_blend)
     b1, b2 = st.columns(2)
     with b1:
         blend_score = st.number_input("score ×", min_value=0.0, step=0.1, format="%.4f", key="blend_score_mult")
@@ -774,29 +814,11 @@ elif mode == "site_blend":
 
 elif mode == "custom":
     st.markdown("Edit multipliers. Defaults approximate the site formula; burns default 1.0× FP.")
-    # Streamlit clears keyed number_input state when those widgets are not rendered
-    # (other weight modes), re-defaulting them to 0 on next mount. Keep multipliers
-    # in saved_mult and copy onto widget keys *before* instantiating inputs.
-    saved = dict(st.session_state.get("saved_mult") or DEFAULT_MULT)
-    for k, default in DEFAULT_MULT.items():
-        if k not in saved:
-            saved[k] = float(default)
-        try:
-            saved[k] = float(saved[k])
-        except (TypeError, ValueError):
-            saved[k] = float(default)
-    # Teardown wipe → all zeros while site defaults are non-zero
-    if all(v == 0.0 for v in saved.values()) and any(float(v) != 0.0 for v in DEFAULT_MULT.values()):
-        saved = {k: float(v) for k, v in DEFAULT_MULT.items()}
-    st.session_state["saved_mult"] = saved
-    for k, val in saved.items():
-        # Assign before widget creation so inputs show site-ish defaults / seed values
-        st.session_state[f"mult_{k}"] = float(val)
-
-    if "lootbox_as_fp" not in st.session_state:
-        st.session_state["lootbox_as_fp"] = bool(st.session_state.get("saved_lootbox_as_fp", False))
-    if "fp_usd" not in st.session_state:
-        st.session_state["fp_usd"] = float(st.session_state.get("saved_fp_usd", 1.0))
+    # Hydrate widget keys from saved_mult ONLY when entering Custom or after a seed apply.
+    # Overwriting mult_* on every rerun snaps user edits back to defaults.
+    entering_custom = st.session_state.get("_prev_weight_mode") != "custom"
+    force_custom = entering_custom or bool(st.session_state.pop("_hydrate_custom_mult", False))
+    hydrate_custom_mult_widgets(force=force_custom)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -922,6 +944,9 @@ else:  # manual
     merged = df[["wallet"]].merge(edited[["wallet", "weight"]], on="wallet", how="left")
     weights = merged["weight"].fillna(0.0)
     manual_map = {str(r.wallet): float(r.weight) for r in edited.itertuples(index=False)}
+
+# Remember mode so next run can detect Custom/blend entry (one-shot hydrate).
+st.session_state["_prev_weight_mode"] = mode
 
 # Build allocation
 alloc = allocate(weights, float(total_pool), dist_method)
