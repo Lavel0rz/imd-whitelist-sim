@@ -373,7 +373,10 @@ def current_knob_snapshot() -> dict:
         "blend_burn": float(st.session_state.get("blend_burn_mult", 1.0)),
         "lootbox_as_fp": bool(st.session_state.get("lootbox_as_fp", False)),
         "fp_usd": float(st.session_state.get("fp_usd", 1.0)),
-        "mult": {k: float(st.session_state.get(f"mult_{k}", DEFAULT_MULT[k])) for k in DEFAULT_MULT},
+        "mult": {
+            k: float((st.session_state.get("saved_mult") or {}).get(k, st.session_state.get(f"mult_{k}", DEFAULT_MULT[k])))
+            for k in DEFAULT_MULT
+        },
     }
 
 
@@ -432,14 +435,23 @@ def apply_seed_to_session(payload: dict, wallets: list[str]) -> list[str]:
     _set_widget_value("top_n", int(payload.get("top_n", 15)))
 
     blend = payload.get("blend") or {}
-    _set_widget_value("blend_score_mult", float(blend.get("score", 1.0)))
-    _set_widget_value("blend_burn_mult", float(blend.get("burn", 1.0)))
+    bs = float(blend.get("score", 1.0))
+    bb = float(blend.get("burn", 1.0))
+    st.session_state["saved_blend_score"] = bs
+    st.session_state["saved_blend_burn"] = bb
+    _set_widget_value("blend_score_mult", bs)
+    _set_widget_value("blend_burn_mult", bb)
 
     mult = payload.get("mult") or {}
-    for k, default in DEFAULT_MULT.items():
-        _set_widget_value(f"mult_{k}", float(mult.get(k, default)))
+    # Source of truth for custom multipliers (survives Streamlit clearing unused widget keys).
+    saved = {k: float(mult.get(k, DEFAULT_MULT[k])) for k in DEFAULT_MULT}
+    st.session_state["saved_mult"] = saved
+    for k, val in saved.items():
+        _set_widget_value(f"mult_{k}", float(val))
     _set_widget_value("lootbox_as_fp", bool(payload.get("lootbox_as_fp", False)))
     _set_widget_value("fp_usd", float(payload.get("fp_usd", 1.0)))
+    st.session_state["saved_lootbox_as_fp"] = bool(payload.get("lootbox_as_fp", False))
+    st.session_state["saved_fp_usd"] = float(payload.get("fp_usd", 1.0))
 
     if mode == "manual":
         manual = payload.get("manual") or {}
@@ -489,11 +501,20 @@ def init_session_defaults() -> None:
         "seed_apply_warnings": [],
         "seed_apply_banner": None,
         "_seed_url_consumed": False,
+        "saved_mult": dict(DEFAULT_MULT),
+        "saved_lootbox_as_fp": False,
+        "saved_fp_usd": 1.0,
+        "saved_blend_score": 1.0,
+        "saved_blend_burn": 1.0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
-    for k, v in DEFAULT_MULT.items():
+    # Ensure saved_mult always has every DEFAULT_MULT key
+    saved = st.session_state.get("saved_mult") or {}
+    fixed = {k: float(saved[k]) if k in saved else float(v) for k, v in DEFAULT_MULT.items()}
+    st.session_state["saved_mult"] = fixed
+    for k, v in fixed.items():
         sk = f"mult_{k}"
         if sk not in st.session_state:
             st.session_state[sk] = float(v)
@@ -725,26 +746,70 @@ elif mode == "site_blend":
         "Blend Analytica site score with lifetime FP burned. "
         "`weight = score × scoreMult + lifetimeFpBurned × burnMult`."
     )
+    # Same teardown issue as custom multipliers — restore from saved_* first.
+    if "blend_score_mult" not in st.session_state:
+        st.session_state["blend_score_mult"] = float(st.session_state.get("saved_blend_score", 1.0))
+    if "blend_burn_mult" not in st.session_state:
+        st.session_state["blend_burn_mult"] = float(st.session_state.get("saved_blend_burn", 1.0))
+    # If keys exist but were wiped to 0 while defaults are 1, restore saved
+    if float(st.session_state.get("blend_score_mult", 0)) == 0.0 and float(st.session_state.get("saved_blend_score", 1.0)) != 0.0:
+        st.session_state["blend_score_mult"] = float(st.session_state.get("saved_blend_score", 1.0))
+    if float(st.session_state.get("blend_burn_mult", 0)) == 0.0 and float(st.session_state.get("saved_blend_burn", 1.0)) != 0.0:
+        st.session_state["blend_burn_mult"] = float(st.session_state.get("saved_blend_burn", 1.0))
     b1, b2 = st.columns(2)
     with b1:
-        blend_score = st.number_input("score ×", step=0.1, format="%.4f", key="blend_score_mult")
+        blend_score = st.number_input("score ×", min_value=0.0, step=0.1, format="%.4f", key="blend_score_mult")
     with b2:
         blend_burn = st.number_input(
             "lifetimeFpBurned ×",
+            min_value=0.0,
             step=0.1,
             format="%.4f",
             key="blend_burn_mult",
             help="FP units from api.pet.game pet.fpSpent (aggregated per wallet).",
         )
+    st.session_state["saved_blend_score"] = float(blend_score)
+    st.session_state["saved_blend_burn"] = float(blend_burn)
     weights = (df["score"] * float(blend_score) + df["lifetimeFpBurned"] * float(blend_burn)).clip(lower=0)
 
 elif mode == "custom":
     st.markdown("Edit multipliers. Defaults approximate the site formula; burns default 1.0× FP.")
+    # Streamlit clears keyed number_input state when those widgets are not rendered
+    # (other weight modes), re-defaulting them to 0 on next mount. Keep multipliers
+    # in saved_mult and copy onto widget keys *before* instantiating inputs.
+    saved = dict(st.session_state.get("saved_mult") or DEFAULT_MULT)
+    for k, default in DEFAULT_MULT.items():
+        if k not in saved:
+            saved[k] = float(default)
+        try:
+            saved[k] = float(saved[k])
+        except (TypeError, ValueError):
+            saved[k] = float(default)
+    # Teardown wipe → all zeros while site defaults are non-zero
+    if all(v == 0.0 for v in saved.values()) and any(float(v) != 0.0 for v in DEFAULT_MULT.values()):
+        saved = {k: float(v) for k, v in DEFAULT_MULT.items()}
+    st.session_state["saved_mult"] = saved
+    for k, val in saved.items():
+        # Assign before widget creation so inputs show site-ish defaults / seed values
+        st.session_state[f"mult_{k}"] = float(val)
+
+    if "lootbox_as_fp" not in st.session_state:
+        st.session_state["lootbox_as_fp"] = bool(st.session_state.get("saved_lootbox_as_fp", False))
+    if "fp_usd" not in st.session_state:
+        st.session_state["fp_usd"] = float(st.session_state.get("saved_fp_usd", 1.0))
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        m_staked = st.number_input("stakedFp ×", step=0.1, format="%.4f", key="mult_stakedFp")
+        m_staked = st.number_input(
+            "stakedFp ×",
+            min_value=0.0,
+            step=0.1,
+            format="%.4f",
+            key="mult_stakedFp",
+        )
         m_shields = st.number_input(
             "shieldsPurchased ×",
+            min_value=0.0,
             step=0.1,
             format="%.4f",
             key="mult_shieldsPurchased",
@@ -753,25 +818,38 @@ elif mode == "custom":
     with c2:
         m_loot = st.number_input(
             "lootboxesOpened ×",
+            min_value=0.0,
             step=0.1,
             format="%.4f",
             key="mult_lootboxesOpened",
             help="Site: $1.50 × 2x = 3 (USD face)",
         )
         m_dice = st.number_input(
-            "diceGamesEntered ×", step=0.1, format="%.4f", key="mult_diceGamesEntered"
+            "diceGamesEntered ×",
+            min_value=0.0,
+            step=0.1,
+            format="%.4f",
+            key="mult_diceGamesEntered",
         )
     with c3:
         m_age = st.number_input(
             "longestPetAliveDays ×",
+            min_value=0.0,
             step=0.01,
             format="%.4f",
             key="mult_longestPetAliveDays",
         )
-        m_stars = st.number_input("stars ×", step=0.01, format="%.4f", key="mult_stars")
+        m_stars = st.number_input(
+            "stars ×",
+            min_value=0.0,
+            step=0.01,
+            format="%.4f",
+            key="mult_stars",
+        )
     with c4:
         m_burn = st.number_input(
             "lifetimeFpBurned ×",
+            min_value=0.0,
             step=0.1,
             format="%.4f",
             key="mult_lifetimeFpBurned",
@@ -786,20 +864,29 @@ elif mode == "custom":
     )
     fp_usd = 1.0
     if lootbox_as_fp:
-        fp_usd = st.number_input("FP price (USD)", min_value=1e-9, step=0.01, format="%.6f", key="fp_usd")
+        fp_usd = st.number_input(
+            "FP price (USD)",
+            min_value=1e-9,
+            step=0.01,
+            format="%.6f",
+            key="fp_usd",
+        )
     else:
-        # keep key stable even when hidden
-        fp_usd = float(st.session_state.get("fp_usd", 1.0))
+        fp_usd = float(st.session_state.get("fp_usd", st.session_state.get("saved_fp_usd", 1.0)))
 
     mult = {
-        "stakedFp": m_staked,
-        "shieldsPurchased": m_shields,
-        "lootboxesOpened": m_loot,
-        "diceGamesEntered": m_dice,
-        "longestPetAliveDays": m_age,
-        "stars": m_stars,
-        "lifetimeFpBurned": m_burn,
+        "stakedFp": float(m_staked),
+        "shieldsPurchased": float(m_shields),
+        "lootboxesOpened": float(m_loot),
+        "diceGamesEntered": float(m_dice),
+        "longestPetAliveDays": float(m_age),
+        "stars": float(m_stars),
+        "lifetimeFpBurned": float(m_burn),
     }
+    # Persist so leaving custom mode does not lose multipliers to widget teardown
+    st.session_state["saved_mult"] = dict(mult)
+    st.session_state["saved_lootbox_as_fp"] = bool(lootbox_as_fp)
+    st.session_state["saved_fp_usd"] = float(fp_usd)
     weights = custom_weights(df, mult, lootbox_as_fp, fp_usd)
 
 else:  # manual
