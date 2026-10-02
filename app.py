@@ -505,6 +505,8 @@ out["weight"] = weights.values
 wsum = float(out["weight"].sum())
 out["weight_pct"] = (out["weight"] / wsum * 100.0) if wsum > 0 else 0.0
 out["imd"] = alloc.values
+pool = float(total_pool)
+out["pct_of_pool"] = (out["imd"] / pool * 100.0) if pool > 0 else 0.0
 out = out.sort_values("imd", ascending=False).reset_index(drop=True)
 
 # Summary metrics
@@ -536,6 +538,7 @@ fig_bar = px.bar(
         "wallet": True,
         "weight": True,
         "weight_pct": ":.3f",
+        "pct_of_pool": ":.4f",
         "lifetimeFpBurned": ":.2f",
         "imd": ":.2f",
         "label": False,
@@ -565,7 +568,29 @@ display["weight"] = display["weight"].map(lambda v: round(float(v), 6))
 display["weight_pct"] = display["weight_pct"].map(lambda v: round(float(v), 6))
 display["lifetimeFpBurned"] = display["lifetimeFpBurned"].map(lambda v: round(float(v), 6))
 display["imd"] = display["imd"].map(lambda v: round(float(v), 6))
-st.dataframe(display, use_container_width=True, height=420)
+display["pct_of_pool"] = display["pct_of_pool"].map(lambda v: round(float(v), 4))
+# Column order: put % of pool next to IMD
+cols = [c for c in display.columns if c != "pct_of_pool"]
+if "imd" in cols:
+    i = cols.index("imd") + 1
+    cols = cols[:i] + ["pct_of_pool"] + cols[i:]
+else:
+    cols = cols + ["pct_of_pool"]
+display = display[cols]
+st.dataframe(
+    display,
+    use_container_width=True,
+    height=420,
+    column_config={
+        "pct_of_pool": st.column_config.NumberColumn(
+            "% of pool",
+            help="100 × IMD / total pool — share of the distribution each wallet receives.",
+            format="%.4f%%",
+        ),
+        "weight_pct": st.column_config.NumberColumn("weight %", format="%.4f"),
+        "imd": st.column_config.NumberColumn("imd", format="%.4f"),
+    },
+)
 
 csv_buf = StringIO()
 display.to_csv(csv_buf, index=False)
