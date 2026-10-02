@@ -26,12 +26,14 @@ Then open http://localhost:8501 (or the host URL if remote).
 - Default pool: 300,000 IMD (editable)
 - Weight modes:
   - **Site score** — use each wallet's Analytica `score`
-  - **Custom component weights** — tune multipliers for staked FP, shields, lootboxes, dice, age, stars
+  - **Site score + burns blend** — `score × m1 + lifetimeFpBurned × m2`
+  - **Custom component weights** — tune multipliers for staked FP, shields, lootboxes, dice, age, stars, **lifetime FP burned**
   - **Manual override** — edit per-wallet weights in a table
 - Distribution methods: pro-rata, equal split, sqrt(weight)
 - Summary metrics (Gini, HHI, top-10 share, min/median/max)
 - Top-N chart, full allocation table, histogram, CSV download
-- Refresh button to re-fetch live whitelist data
+- Refresh button re-fetches whitelist **and** lifetime FP burned (`fp-burns.json` sidecar)
+- Burns source: GraphQL `https://api.pet.game` field `pet.fpSpent` (wei→FP), aggregated per wallet from whitelist pet IDs. Missing wallets treated as 0.
 
 ## Verify allocation math
 
