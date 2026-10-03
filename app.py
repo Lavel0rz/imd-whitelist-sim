@@ -21,7 +21,7 @@ GRAPHQL_URL = "https://api.pet.game"
 LOCAL_JSON = Path(__file__).resolve().parent / "fp-whitelist.json"
 BURNS_JSON = Path(__file__).resolve().parent / "fp-burns.json"
 FALLBACK_JSON = Path("/workspace/fp-whitelist.json")
-DEFAULT_POOL = 300_000.0
+DEFAULT_POOL = 250_000.0
 SEED_PREFIX = "imd1."
 
 # Site-ish defaults (from blurb):

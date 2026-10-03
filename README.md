@@ -23,7 +23,7 @@ Then open http://localhost:8501 (or the host URL if remote).
 
 ## Features
 
-- Default pool: 300,000 IMD (editable)
+- Default pool: 250,000 IMD (editable)
 - Weight modes:
   - **Site score** — use each wallet's Analytica `score`
   - **Site score + burns blend** — `score × m1 + burnFpSum × m2` (`burnFpSum` = shroom + shield + other shop + dice + loot + pass; not a separate source)
@@ -40,7 +40,7 @@ Then open http://localhost:8501 (or the host URL if remote).
 
 ## Verify allocation math
 
-With default 300k + site scores, top wallet (score 185320 / sum ≈ 1,872,539) should receive ≈ 29,690 IMD.
+With default 250k + site scores, top wallet (score 185320 / sum ≈ 1,872,539) should receive ≈ 24,742 IMD.
 
 ## Virtualenv (recommended)
 
