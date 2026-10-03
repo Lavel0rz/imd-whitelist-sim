@@ -27,7 +27,30 @@ SEED_PREFIX = "imd1."
 # score uses staked FP per alive pet, shields at 6 FP each (2x) => 12 FP-eq per shield,
 # lootboxes at $1.50 each (2x) => 3 USD-eq; convert via FP USD price,
 # dice 0.5x, age 0.1x, stars 0.1x.
-# lifetimeFpBurned: 1.0 = Shroom-burn FP (catalog) counts 1:1 in custom weight.
+# Per-action FP burn columns (NOT one lifetime total). Each defaults to 1.0 so a
+# custom weight counts that action's FP 1:1. Stake upgrades are not burn columns.
+# burnFpSum is only the sum of these columns — not an extra spend source.
+BURN_FP_COLUMNS = (
+    "shroomFp",
+    "shieldFp",
+    "otherShopFp",
+    "diceFp",
+    "lootFp",
+    "passFp",
+)
+BURN_FP_SUM_COL = "burnFpSum"
+SHROOM_ITEM_ID = 0
+SHIELD_ITEM_ID = 6
+BURN_COLUMN_HELP = {
+    "shroomFp": "Shop Shroom buys × catalog list FP (item 0). Not a stake upgrade.",
+    "shieldFp": "Shop shield buys × catalog list FP (item 6).",
+    "otherShopFp": "Other shop burns: insurance + cosmetics × catalog list FP. Not upgrades 1–5.",
+    "diceFp": "Dice joins × 0.2 FP.",
+    "lootFp": "Lootbox spins × ($2 / FP_USD snapshot).",
+    "passFp": "Monthly passes bought × ($15 / FP_USD snapshot).",
+    "burnFpSum": "Sum of shroomFp + shieldFp + otherShopFp + diceFp + lootFp + passFp. Not a separate source.",
+}
+
 DEFAULT_MULT = {
     "stakedFp": 1.0,
     "shieldsPurchased": 12.0,  # 6 FP * 2x
@@ -35,7 +58,12 @@ DEFAULT_MULT = {
     "diceGamesEntered": 0.5,
     "longestPetAliveDays": 0.1,
     "stars": 0.1,
-    "lifetimeFpBurned": 1.0,
+    "shroomFp": 1.0,
+    "shieldFp": 1.0,
+    "otherShopFp": 1.0,
+    "diceFp": 1.0,
+    "lootFp": 1.0,
+    "passFp": 1.0,
 }
 
 MODE_OPTIONS = ["site", "site_blend", "custom", "manual"]
@@ -122,7 +150,7 @@ def fetch_fp_usd_price(timeout: float = 20.0) -> float:
     return float(rows[-1].get("fp_price") or 1.0)
 
 
-# Shop upgrades stake FP into the pet — excluded from lifetimeFpBurned (pure stake).
+# Shop upgrades stake FP into the pet — excluded from burn columns (pure stake).
 STAKE_ITEM_IDS = frozenset({1, 2, 3, 4, 5})
 DICE_JOIN_FP = 0.2
 PASS_USD = 15.0  # in-game "Pass for $15"
@@ -156,7 +184,7 @@ def discover_consumed_item_ids(scan_max: int = CONSUMED_ITEM_ID_SCAN_MAX) -> dic
 
 
 def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
-    """Sum in-game FP spend per wallet and treat as lifetimeFpBurned.
+    """Per-wallet FP burn split into action columns (not one lifetime total).
 
     Included (api.pet.game + catalog / known unit costs):
       - Shop `consumeds` (giver, isSell:false) × list FP price — Shroom, shields,
@@ -169,7 +197,7 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
     free wheel spins / gacha (no FP cost in docs).
 
     Unknown itemIds (buys outside catalog, no LEGACY_ITEM_PRICES_FP entry) are counted
-    in breakdown.unpricedItemCounts but not added to lifetimeFpBurned.
+    in breakdown.unpricedItemCounts but not added to any burn column.
 
     Julio policy: weigh all such spend as burned FP for IMD sim purposes.
     """
@@ -231,6 +259,9 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
 
         shop_burn = 0.0
         shop_stake = 0.0
+        shroom_fp = 0.0
+        shield_fp = 0.0
+        other_shop_fp = 0.0
         by_name: dict[str, float] = {}
         unpriced: dict[str, int] = {}
         for iid, cnt in counts.items():
@@ -245,27 +276,43 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
             by_name[name] = round(by_name.get(name, 0.0) + fp, 6)
             if iid in STAKE_ITEM_IDS:
                 shop_stake += fp
+            elif iid == SHROOM_ITEM_ID:
+                shroom_fp += fp
+                shop_burn += fp
+            elif iid == SHIELD_ITEM_ID:
+                shield_fp += fp
+                shop_burn += fp
             else:
+                other_shop_fp += fp
                 shop_burn += fp
 
         dice_fp = dice * DICE_JOIN_FP
         loot_fp_amt = loot * loot_fp
         pass_fp_amt = passes * pass_fp
-        total = shop_burn + dice_fp + loot_fp_amt + pass_fp_amt
+        # Round each action, then sum those rounded columns so burnFpSum is not
+        # a hidden extra source.
+        cols = {
+            "shroomFp": round(shroom_fp, 6),
+            "shieldFp": round(shield_fp, 6),
+            "otherShopFp": round(other_shop_fp, 6),
+            "diceFp": round(dice_fp, 6),
+            "lootFp": round(loot_fp_amt, 6),
+            "passFp": round(pass_fp_amt, 6),
+        }
+        total = round(sum(cols.values()), 6)
 
         detail = {
             "shopBurnFp": round(shop_burn, 6),
             "shopStakeUpgradeFp": round(shop_stake, 6),
-            "diceFp": round(dice_fp, 6),
-            "lootFp": round(loot_fp_amt, 6),
-            "passFp": round(pass_fp_amt, 6),
+            **cols,
+            "burnFpSum": total,
             "diceJoins": dice,
             "lootSpins": loot,
             "passesBought": passes,
             "mushroomFeeds": int(counts.get(0, 0)),
             "byItemFp": by_name,
             "unpricedItemCounts": unpriced,
-            "totalBurnFp": round(total, 6),
+            "totalBurnFp": total,
         }
         return addr, {"counts": counts, "detail": detail, "total": total}
 
@@ -296,14 +343,23 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
             breakdown[addr] = {
                 "shopBurnFp": 0.0,
                 "shopStakeUpgradeFp": 0.0,
+                "shroomFp": 0.0,
+                "shieldFp": 0.0,
+                "otherShopFp": 0.0,
                 "diceFp": 0.0,
                 "lootFp": 0.0,
                 "passFp": 0.0,
+                "burnFpSum": 0.0,
                 "totalBurnFp": 0.0,
             }
             missing += 1
 
     nonzero = sum(1 for v in burns.values() if v > 0)
+    burn_column_sums = {c: 0.0 for c in (*BURN_FP_COLUMNS, BURN_FP_SUM_COL)}
+    for d in breakdown.values():
+        for c in burn_column_sums:
+            burn_column_sums[c] += float(d.get(c) or 0.0)
+    burn_column_sums = {c: round(v, 6) for c, v in burn_column_sums.items()}
     unpriced_global = {str(i): global_buys[i] for i in unpriced_ids if global_buys.get(i, 0) > 0}
     unpriced_wallet_hits = sum(
         1
@@ -313,10 +369,13 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
     return {
         "source": GRAPHQL_URL,
         "method": (
-            "All in-game FP spend as burn: shop consumeds (ex-upgrades) × list FP + "
-            f"dice×{DICE_JOIN_FP} + loot×(${LOOT_USD}/FP_USD) + pass×(${PASS_USD}/FP_USD)"
+            "Per-action FP burn columns (sum = burnFpSum): "
+            "shroomFp + shieldFp + otherShopFp (shop consumeds ex-upgrades × list FP) + "
+            f"diceFp (×{DICE_JOIN_FP}) + lootFp (${LOOT_USD}/FP_USD) + passFp (${PASS_USD}/FP_USD)"
         ),
-        "field": "consumeds[*]+dice+loot+pass",
+        "field": "shroomFp+shieldFp+otherShopFp+diceFp+lootFp+passFp",
+        "burnColumns": list(BURN_FP_COLUMNS),
+        "burnColumnSums": burn_column_sums,
         "burnItemIds": [i for i in sorted(prices) if i not in STAKE_ITEM_IDS],
         "stakeItemIds": sorted(STAKE_ITEM_IDS),
         "scannedItemIds": item_ids,
@@ -337,9 +396,11 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
         "itemPricesFp": {str(i): prices[i]["priceFp"] for i in sorted(prices)},
         "itemNames": {str(i): prices[i]["name"] for i in sorted(prices)},
         "note": (
-            "lifetimeFpBurned sums Shroom/shields/insurance/cosmetics shop buys (list FP), "
-            "dice (0.2 FP), lootboxes ($2/FP_USD), passes ($15/FP_USD). "
-            "Upgrade items 1–5 excluded (stake). NOT pet.fpSpent / stakedFp. "
+            "Burn FP is separate columns, not one lifetime total: "
+            "shroomFp (item 0), shieldFp (item 6), otherShopFp (insurance + cosmetics), "
+            "diceFp (0.2 FP), lootFp ($2/FP_USD), passFp ($15/FP_USD). "
+            "burnFpSum / burns / totalBurnFp equal the sum of those columns — not an extra source. "
+            "Upgrade items 1–5 excluded (stake, shopStakeUpgradeFp). NOT pet.fpSpent / stakedFp. "
             "Catalog & FP_USD are snapshots; historical costs may differ. "
             "Wheel/gacha treated as free (no FP in docs). "
             "Scans consumeds itemIds 0–"
@@ -359,6 +420,72 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
     }
 
 
+def burn_action_fps(detail: dict | None) -> dict[str, float]:
+    """Named FP burn columns from a wallet breakdown.
+
+    Uses columns already stored, else splits shop via byItemFp (Shroom / shield /
+    remainder). Does not price anything new. Stake upgrades are omitted.
+    burnFpSum is the sum of the action columns.
+    """
+    detail = detail or {}
+    if all(k in detail for k in BURN_FP_COLUMNS):
+        cols = {k: round(float(detail.get(k) or 0.0), 6) for k in BURN_FP_COLUMNS}
+    else:
+        by = detail.get("byItemFp") or {}
+        if not isinstance(by, dict):
+            by = {}
+        shroom = float(by.get("Shroom") or by.get("shroom") or 0.0)
+        shield = float(by.get("shield") or by.get("Shield") or 0.0)
+        if "shopBurnFp" in detail and detail.get("shopBurnFp") is not None:
+            shop = float(detail.get("shopBurnFp") or 0.0)
+        else:
+            shop = 0.0
+            for name, fp in by.items():
+                if str(name).lower().startswith("upgrade"):
+                    continue
+                shop += float(fp or 0.0)
+        other = shop - shroom - shield
+        if other < 0 and other > -1e-4:
+            other = 0.0
+        cols = {
+            "shroomFp": round(shroom, 6),
+            "shieldFp": round(shield, 6),
+            "otherShopFp": round(max(other, 0.0), 6),
+            "diceFp": round(float(detail.get("diceFp") or 0.0), 6),
+            "lootFp": round(float(detail.get("lootFp") or 0.0), 6),
+            "passFp": round(float(detail.get("passFp") or 0.0), 6),
+        }
+    total = round(sum(cols[k] for k in BURN_FP_COLUMNS), 6)
+    cols[BURN_FP_SUM_COL] = total
+    return cols
+
+
+def mult_from_payload(raw: dict | None) -> dict[str, float]:
+    """DEFAULT_MULT filled from a seed/saved dict.
+
+    Older seeds stored a single lifetimeFpBurned multiplier. If per-action keys
+    are absent, that multiplier is applied to every burn column (equivalent to
+    weighting their sum).
+    """
+    raw = raw or {}
+    legacy = raw.get("lifetimeFpBurned", None)
+    out: dict[str, float] = {}
+    for k, default in DEFAULT_MULT.items():
+        if k in raw and raw[k] is not None:
+            try:
+                out[k] = float(raw[k])
+            except (TypeError, ValueError):
+                out[k] = float(default)
+        elif k in BURN_FP_COLUMNS and legacy is not None:
+            try:
+                out[k] = float(legacy)
+            except (TypeError, ValueError):
+                out[k] = float(default)
+        else:
+            out[k] = float(default)
+    return out
+
+
 def _map_lookup(m: dict, addr: str, default=0.0):
     if addr in m:
         return m[addr]
@@ -368,12 +495,15 @@ def _map_lookup(m: dict, addr: str, default=0.0):
 
 def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
     burns_meta = burns_meta or {}
-    burns_map = burns_meta.get("burns") or {}
     feeds_map = burns_meta.get("mushroomFeeds") or {}
-    spend_map = burns_meta.get("fpItemSpend") or {}
+    bd_map = burns_meta.get("breakdown") or {}
     rows = []
     for w in data.get("wallets", []):
         addr = w["wallet"]
+        detail = _map_lookup(bd_map, addr, {}) or {}
+        if not isinstance(detail, dict):
+            detail = {}
+        actions = burn_action_fps(detail)
         rows.append(
             {
                 "wallet": addr,
@@ -386,9 +516,8 @@ def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
                 "longestPetAliveDays": float(w.get("longestPetAliveDays") or 0),
                 "stars": float(w.get("stars") or 0),
                 "alivePetCount": float(w.get("alivePetCount") or 0),
-                "lifetimeFpBurned": float(_map_lookup(burns_map, addr, 0.0) or 0),
+                **actions,
                 "mushroomFeeds": float(_map_lookup(feeds_map, addr, 0) or 0),
-                "fpItemSpend": float(_map_lookup(spend_map, addr, 0.0) or 0),
             }
         )
     df = pd.DataFrame(rows)
@@ -405,7 +534,6 @@ def custom_weights(df: pd.DataFrame, mult: dict, lootbox_as_fp: bool, fp_usd: fl
     else:
         loot_contrib = df["lootboxesOpened"] * loot_mult
 
-    burned_col = df["lifetimeFpBurned"] if "lifetimeFpBurned" in df.columns else 0.0
     w = (
         df["stakedFp"] * float(mult["stakedFp"])
         + df["shieldsPurchased"] * float(mult["shieldsPurchased"])
@@ -413,8 +541,10 @@ def custom_weights(df: pd.DataFrame, mult: dict, lootbox_as_fp: bool, fp_usd: fl
         + df["diceGamesEntered"] * float(mult["diceGamesEntered"])
         + df["longestPetAliveDays"] * float(mult["longestPetAliveDays"])
         + df["stars"] * float(mult["stars"])
-        + burned_col * float(mult.get("lifetimeFpBurned", 0.0))
     )
+    for col in BURN_FP_COLUMNS:
+        series = df[col] if col in df.columns else 0.0
+        w = w + series * float(mult.get(col, 0.0))
     return w.clip(lower=0)
 
 
@@ -563,13 +693,7 @@ def _set_widget_value(key: str, value) -> None:
 
 def ensure_saved_mult() -> dict[str, float]:
     """Return a complete saved_mult dict (DEFAULT_MULT keys), repairing all-zero wipes."""
-    saved_raw = st.session_state.get("saved_mult") or {}
-    saved: dict[str, float] = {}
-    for k, default in DEFAULT_MULT.items():
-        try:
-            saved[k] = float(saved_raw[k]) if k in saved_raw else float(default)
-        except (TypeError, ValueError):
-            saved[k] = float(default)
+    saved = mult_from_payload(st.session_state.get("saved_mult") or {})
     if all(v == 0.0 for v in saved.values()) and any(float(v) != 0.0 for v in DEFAULT_MULT.values()):
         saved = {k: float(v) for k, v in DEFAULT_MULT.items()}
     st.session_state["saved_mult"] = saved
@@ -631,7 +755,7 @@ def seed_knob_snapshot(payload: dict) -> dict:
         "blend_burn": float(blend.get("burn", 1.0)),
         "lootbox_as_fp": bool(payload.get("lootbox_as_fp", False)),
         "fp_usd": float(payload.get("fp_usd", 1.0)),
-        "mult": {k: float(mult.get(k, DEFAULT_MULT[k])) for k in DEFAULT_MULT},
+        "mult": mult_from_payload(mult),
     }
 
 
@@ -683,7 +807,8 @@ def apply_seed_to_session(payload: dict, wallets: list[str]) -> list[str]:
 
     mult = payload.get("mult") or {}
     # Source of truth for custom multipliers (survives Streamlit clearing unused widget keys).
-    saved = {k: float(mult.get(k, DEFAULT_MULT[k])) for k in DEFAULT_MULT}
+    # Legacy seeds with only lifetimeFpBurned apply that multiplier to every burn column.
+    saved = mult_from_payload(mult)
     st.session_state["saved_mult"] = saved
     for k, val in saved.items():
         _set_widget_value(f"mult_{k}", float(val))
@@ -756,8 +881,7 @@ def init_session_defaults() -> None:
         if k not in st.session_state:
             st.session_state[k] = v
     # Ensure saved_mult always has every DEFAULT_MULT key
-    saved = st.session_state.get("saved_mult") or {}
-    fixed = {k: float(saved[k]) if k in saved else float(v) for k, v in DEFAULT_MULT.items()}
+    fixed = mult_from_payload(st.session_state.get("saved_mult") or {})
     st.session_state["saved_mult"] = fixed
     for k, v in fixed.items():
         sk = f"mult_{k}"
@@ -779,7 +903,8 @@ init_session_defaults()
 
 st.title("🐾 IMD Whitelist Distribution Simulator")
 st.caption(
-    f"Source: [{DATA_URL}]({DATA_URL}) · Burns: [{GRAPHQL_URL}]({GRAPHQL_URL}) all in-game FP spend (shop+dice+loot+pass; not stake/`fpSpent`) · "
+    f"Source: [{DATA_URL}]({DATA_URL}) · Burns: [{GRAPHQL_URL}]({GRAPHQL_URL}) per-action FP "
+    "(shroom, shield, other shop, dice, loot, pass; not stake/`fpSpent`) · "
     "Simulation only — **not** an official airdrop. "
     "Score blurb: staked FP per alive pet; shields 6 FP × 2x; lootboxes $1.50 × 2x; "
     "dice 0.5x; age 0.1x; stars 0.1x. "
@@ -941,25 +1066,34 @@ meta_cols = st.columns(5)
 meta_cols[0].metric("Wallets", int(data.get("walletCount") or len(df)))
 meta_cols[1].metric("Alive pets", int(data.get("alivePetCount") or 0))
 meta_cols[2].metric("Site score sum", f"{df['score'].sum():,.0f}")
-meta_cols[3].metric("FP burned sum", f"{df['lifetimeFpBurned'].sum():,.0f}")
+meta_cols[3].metric(
+    "burnFpSum",
+    f"{df[BURN_FP_SUM_COL].sum():,.0f}",
+    help="Sum of per-action burn columns (shroom + shield + other shop + dice + loot + pass).",
+)
 updated = data.get("updatedAt")
 burns_updated = burns_meta.get("updatedAt")
 meta_cols[4].metric("updatedAt (unix)", updated if updated is not None else "—")
 
-zero_burns = int((df["lifetimeFpBurned"] <= 0).sum())
-if not (burns_meta.get("burns") or burns_meta.get("updatedAt")):
+zero_burns = int((df[BURN_FP_SUM_COL] <= 0).sum())
+if not (burns_meta.get("breakdown") or burns_meta.get("burns") or burns_meta.get("updatedAt")):
     st.warning(
         "No burn cache yet (`fp-burns.json`). Click **Refresh whitelist + burns** "
-        "or treat lifetime FP burned as 0 for all wallets."
+        "or treat every burn-action column as 0."
     )
 else:
     st.info(
-        f"Burn/spend source: `{burns_meta.get('method') or burns_meta.get('field')}` "
+        f"Burn columns: `{', '.join(BURN_FP_COLUMNS)}` → `{BURN_FP_SUM_COL}` is their sum "
+        f"(not a separate source). Method: `{burns_meta.get('method') or burns_meta.get('field')}` "
         f"(FP_USD≈{burns_meta.get('fpUsd')}; updatedAt={burns_updated}). "
         f"{burns_meta.get('walletsWithBurns', len(df) - zero_burns)} wallets with spend; "
         f"{zero_burns} at 0. "
-        "All in-game FP spend (ex stake upgrades) — **not** `pet.fpSpent`/`stakedFp`."
+        "Stake upgrades / `pet.fpSpent` / `stakedFp` are **not** burns."
     )
+
+burn_metric_cols = st.columns(len(BURN_FP_COLUMNS))
+for i, col in enumerate(BURN_FP_COLUMNS):
+    burn_metric_cols[i].metric(col, f"{df[col].sum():,.1f}", help=BURN_COLUMN_HELP[col])
 
 st.divider()
 
@@ -990,8 +1124,11 @@ if mode == "site":
 
 elif mode == "site_blend":
     st.markdown(
-        "Blend Analytica site score with lifetime FP burned. "
-        "`weight = score × scoreMult + lifetimeFpBurned × burnMult`."
+        "Blend Analytica site score with **burnFpSum** "
+        "(shroomFp + shieldFp + otherShopFp + diceFp + lootFp + passFp). "
+        "`weight = score × scoreMult + burnFpSum × burnMult`. "
+        "burnFpSum is only the sum of those columns. "
+        "To weight each burn action differently, use **Custom component weights**."
     )
     entering_blend = st.session_state.get("_prev_weight_mode") != "site_blend"
     force_blend = entering_blend or bool(st.session_state.pop("_hydrate_blend", False))
@@ -1001,26 +1138,30 @@ elif mode == "site_blend":
         blend_score = st.number_input("score ×", min_value=0.0, step=0.1, format="%.4f", key="blend_score_mult")
     with b2:
         blend_burn = st.number_input(
-            "lifetimeFpBurned ×",
+            "burnFpSum × (sum of burn columns)",
             min_value=0.0,
             step=0.1,
             format="%.4f",
             key="blend_burn_mult",
-            help="All in-game FP spend (shop ex-upgrades + dice + loot + pass). Not stake/fpSpent.",
+            help="Multiplies the sum of shroom/shield/other shop/dice/loot/pass FP. Not stake/fpSpent.",
         )
     st.session_state["saved_blend_score"] = float(blend_score)
     st.session_state["saved_blend_burn"] = float(blend_burn)
-    weights = (df["score"] * float(blend_score) + df["lifetimeFpBurned"] * float(blend_burn)).clip(lower=0)
+    weights = (df["score"] * float(blend_score) + df[BURN_FP_SUM_COL] * float(blend_burn)).clip(lower=0)
 
 elif mode == "custom":
-    st.markdown("Edit multipliers. Defaults approximate the site formula; burns default 1.0× FP.")
+    st.markdown(
+        "Edit multipliers. Site-style defaults approximate the Analytica score. "
+        "Each FP burn action has its own multiplier (default 1.0× that column's FP). "
+        "Count inputs (shieldsPurchased, lootboxesOpened, diceGamesEntered) are separate from the FP columns — set one to 0 if you only want the other."
+    )
     # Hydrate widget keys from saved_mult ONLY when entering Custom or after a seed apply.
     # Overwriting mult_* on every rerun snaps user edits back to defaults.
     entering_custom = st.session_state.get("_prev_weight_mode") != "custom"
     force_custom = entering_custom or bool(st.session_state.pop("_hydrate_custom_mult", False))
     hydrate_custom_mult_widgets(force=force_custom)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         m_staked = st.number_input(
             "stakedFp × (staked, not burn)",
@@ -1069,15 +1210,23 @@ elif mode == "custom":
             format="%.4f",
             key="mult_stars",
         )
-    with c4:
-        m_burn = st.number_input(
-            "lifetimeFpBurned ×",
-            min_value=0.0,
-            step=0.1,
-            format="%.4f",
-            key="mult_lifetimeFpBurned",
-            help="Sum of shop FP spend (ex stake upgrades) + dice/loot/pass. Treated as burned for sim.",
-        )
+    st.markdown(
+        "**FP burn actions** — weighted independently. "
+        "Not stake upgrades. The table's `burnFpSum` is only these six columns added together."
+    )
+    bc1, bc2, bc3 = st.columns(3)
+    burn_inputs: dict[str, float] = {}
+    burn_slots = (bc1, bc2, bc3, bc1, bc2, bc3)
+    for slot, col in zip(burn_slots, BURN_FP_COLUMNS):
+        with slot:
+            burn_inputs[col] = st.number_input(
+                f"{col} ×",
+                min_value=0.0,
+                step=0.1,
+                format="%.4f",
+                key=f"mult_{col}",
+                help=BURN_COLUMN_HELP[col],
+            )
 
     lootbox_as_fp = st.checkbox(
         "Convert lootbox USD face → FP using FP USD price",
@@ -1104,7 +1253,7 @@ elif mode == "custom":
         "diceGamesEntered": float(m_dice),
         "longestPetAliveDays": float(m_age),
         "stars": float(m_stars),
-        "lifetimeFpBurned": float(m_burn),
+        **{col: float(burn_inputs[col]) for col in BURN_FP_COLUMNS},
     }
     # Persist so leaving custom mode does not lose multipliers to widget teardown
     st.session_state["saved_mult"] = dict(mult)
@@ -1151,7 +1300,9 @@ st.session_state["_prev_weight_mode"] = mode
 
 # Build allocation
 alloc = allocate(weights, float(total_pool), dist_method)
-out = df[["wallet", "rank", "score", "lifetimeFpBurned", "mushroomFeeds", "fpItemSpend", "stakedFp"]].copy()
+out = df[
+    ["wallet", "rank", "score", *BURN_FP_COLUMNS, BURN_FP_SUM_COL, "mushroomFeeds", "stakedFp"]
+].copy()
 out["weight"] = weights.values
 wsum = float(out["weight"].sum())
 out["weight_pct"] = (out["weight"] / wsum * 100.0) if wsum > 0 else 0.0
@@ -1233,9 +1384,14 @@ fig_bar = px.bar(
         "weight": True,
         "weight_pct": ":.3f",
         "pct_of_pool": ":.4f",
-        "lifetimeFpBurned": ":.2f",
+        "burnFpSum": ":.2f",
+        "shroomFp": ":.2f",
+        "shieldFp": ":.2f",
+        "otherShopFp": ":.2f",
+        "diceFp": ":.2f",
+        "lootFp": ":.2f",
+        "passFp": ":.2f",
         "mushroomFeeds": True,
-        "fpItemSpend": ":.2f",
         "imd": ":.2f",
         "label": False,
     },
@@ -1262,9 +1418,9 @@ st.subheader("Full allocation")
 display = out.copy()
 display["weight"] = display["weight"].map(lambda v: round(float(v), 6))
 display["weight_pct"] = display["weight_pct"].map(lambda v: round(float(v), 6))
-display["lifetimeFpBurned"] = display["lifetimeFpBurned"].map(lambda v: round(float(v), 6))
+for _col in (*BURN_FP_COLUMNS, BURN_FP_SUM_COL):
+    display[_col] = display[_col].map(lambda v: round(float(v), 6))
 display["mushroomFeeds"] = display["mushroomFeeds"].map(lambda v: int(float(v)))
-display["fpItemSpend"] = display["fpItemSpend"].map(lambda v: round(float(v), 6))
 display["stakedFp"] = display["stakedFp"].map(lambda v: round(float(v), 6))
 display["imd"] = display["imd"].map(lambda v: round(float(v), 6))
 display["pct_of_pool"] = display["pct_of_pool"].map(lambda v: round(float(v), 4))
@@ -1288,6 +1444,10 @@ st.dataframe(
         ),
         "weight_pct": st.column_config.NumberColumn("weight %", format="%.4f"),
         "imd": st.column_config.NumberColumn("imd", format="%.4f"),
+        **{
+            col: st.column_config.NumberColumn(col, help=BURN_COLUMN_HELP[col], format="%.4f")
+            for col in (*BURN_FP_COLUMNS, BURN_FP_SUM_COL)
+        },
     },
 )
 
@@ -1310,12 +1470,13 @@ with st.expander("Compare alternate methods (same weights)"):
     st.dataframe(cmp.head(25), use_container_width=True)
 
 with st.expander("Top burners vs top score (glance)"):
-    glance = df[["wallet", "score", "lifetimeFpBurned", "mushroomFeeds", "fpItemSpend", "stakedFp"]].copy()
+    glance_cols = ["wallet", "score", *BURN_FP_COLUMNS, BURN_FP_SUM_COL, "mushroomFeeds", "stakedFp"]
+    glance = df[glance_cols].copy()
     c_a, c_b = st.columns(2)
     with c_a:
-        st.markdown("**Top 10 by lifetime FP burned** (all in-game spend)")
+        st.markdown("**Top 10 by burnFpSum** (sum of action columns, not stake)")
         st.dataframe(
-            glance.sort_values("lifetimeFpBurned", ascending=False).head(10).reset_index(drop=True),
+            glance.sort_values(BURN_FP_SUM_COL, ascending=False).head(10).reset_index(drop=True),
             use_container_width=True,
         )
     with c_b:
