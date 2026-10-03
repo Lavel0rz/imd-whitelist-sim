@@ -48,9 +48,11 @@ V1_BEER_LIST_FP = 50.0
 V1_BEER_CONTRACT = "0x85b157ebaaf289de5301ae6694b651bf3b8df1c3"
 V1_BURNS_CSV = Path(__file__).resolve().parent / "v1-out" / "fp_v1_burns.csv"
 V1_BURNS_JSON = Path(__file__).resolve().parent / "v1-out" / "fp_v1_burns.json"
+V1_DIRECT_JSON = Path(__file__).resolve().parent / "v1-out" / "beer_direct.json"
 BEER_NOTE = (
-    "V1 contract only (0x85b157ebaaf289de5301ae6694b651bf3b8df1c3), "
-    "Aug–Sep 2023 foods; later diamond buys are not in this column. "
+    "beerCount = V1 item-5 buys (50 FP to 0x0) plus diamond-era item-5 beers "
+    "(exact 50 FP to 0x0e22…443C while that item was still beer). "
+    "Current diamond item 5 is upgrade 5 at 1000 FP and is not counted. "
     "Not included in burnFpSum."
 )
 SHROOM_ITEM_ID = 0
@@ -207,6 +209,31 @@ def load_v1_beer() -> dict[str, tuple[int, float]]:
                 beer = {}
             count, fp = _beer_pair_from_count_fp(beer.get("count"), beer.get("fp"))
             out[addr.lower()] = (count, fp)
+    return out
+
+
+
+def load_direct_beer() -> dict[str, int]:
+    """Lowercase wallet → diamond-era beers (exact 50 FP to the diamond).
+
+    Missing file or missing wallet means 0. Added to V1 item-5 counts.
+    Does not include later 1000 FP upgrade-5 buys. Does not touch burnFpSum.
+    """
+    if not V1_DIRECT_JSON.exists():
+        return {}
+    with open(V1_DIRECT_JSON, encoding="utf-8") as f:
+        payload = json.load(f)
+    raw = payload.get("directCountByWallet") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for addr, count in raw.items():
+        try:
+            n = int(count)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            out[str(addr).lower()] = n
     return out
 
 
@@ -512,9 +539,9 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
             "Wheel/gacha treated as free (no FP in docs). "
             "Scans consumeds itemIds 0–"
             f"{CONSUMED_ITEM_ID_SCAN_MAX}; unknown ids listed in unpriced* (not summed). "
-            "V1 beer is a separate beerCount/beerFp column (contract "
+            "Beer is a separate beerCount/beerFp column (V1 item 5 plus diamond-era exact-50 FP beers, contract "
             + V1_BEER_CONTRACT
-            + " only, Aug–Sep 2023); it is not added to burnFpSum. "
+            + "); diamond item 5 is not beer. beerFp is not added to burnFpSum. "
             "Other V1 foods are not distinct itemIds in api.pet.game."
         ),
         "updatedAt": int(time.time()),
@@ -608,6 +635,7 @@ def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
     feeds_map = burns_meta.get("mushroomFeeds") or {}
     bd_map = burns_meta.get("breakdown") or {}
     beer_map = load_v1_beer()
+    direct_beer = load_direct_beer()
     rows = []
     for w in data.get("wallets", []):
         addr = w["wallet"]
@@ -616,6 +644,9 @@ def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
             detail = {}
         actions = burn_action_fps(detail)
         beer_count, beer_fp = beer_map.get(str(addr).lower(), (0, 0.0))
+        extra_beer = direct_beer.get(str(addr).lower(), 0)
+        beer_count = int(beer_count) + int(extra_beer)
+        beer_fp = float(beer_fp) + float(extra_beer) * V1_BEER_LIST_FP
         rows.append(
             {
                 "wallet": addr,
@@ -1026,7 +1057,7 @@ st.caption(
     "Score blurb: staked FP per alive pet; shields 6 FP × 2x; lootboxes $1.50 × 2x; "
     "dice 0.5x; age 0.1x; stars 0.1x. "
     "**Seeds lock the formula/knobs; whitelist/score snapshots may drift.** "
-    "Beer consumed is V1-only (Aug–Sep 2023) and is not inside burnFpSum."
+    "Beer consumed is V1 item 5 plus diamond-era exact-50 FP beers, and is not inside burnFpSum."
 )
 
 # Load whitelist early so seed apply can align manual maps
@@ -1600,12 +1631,12 @@ st.dataframe(
         },
         BEER_COUNT_COL: st.column_config.NumberColumn(
             "beer consumed",
-            help=BEER_NOTE + " Count of V1 item id 5 buys. 0 if the wallet has no V1 beer.",
+            help=BEER_NOTE + " 0 if the wallet has neither V1 item-5 buys nor a diamond-era 50 FP beer.",
             format="%d",
         ),
         BEER_FP_COL: st.column_config.NumberColumn(
             "beer consumed FP",
-            help=BEER_NOTE + " FP actually paid (50 FP × count). Separate from burnFpSum.",
+            help=BEER_NOTE + " 50 FP × beerCount. Separate from burnFpSum.",
             format="%.4f",
         ),
     },
