@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import json
 import time
 import zlib
@@ -39,6 +40,19 @@ BURN_FP_COLUMNS = (
     "passFp",
 )
 BURN_FP_SUM_COL = "burnFpSum"
+# V1 beer is NOT a burnFpSum column. It was already a V1 burn and must not be
+# double-counted into shroom/shield/other shop. Custom weights scale beerFp alone.
+BEER_COUNT_COL = "beerCount"
+BEER_FP_COL = "beerFp"
+V1_BEER_LIST_FP = 50.0
+V1_BEER_CONTRACT = "0x85b157ebaaf289de5301ae6694b651bf3b8df1c3"
+V1_BURNS_CSV = Path(__file__).resolve().parent / "v1-out" / "fp_v1_burns.csv"
+V1_BURNS_JSON = Path(__file__).resolve().parent / "v1-out" / "fp_v1_burns.json"
+BEER_NOTE = (
+    "V1 contract only (0x85b157ebaaf289de5301ae6694b651bf3b8df1c3), "
+    "Aug–Sep 2023 foods; later diamond buys are not in this column. "
+    "Not included in burnFpSum."
+)
 SHROOM_ITEM_ID = 0
 SHIELD_ITEM_ID = 6
 BURN_COLUMN_HELP = {
@@ -48,7 +62,7 @@ BURN_COLUMN_HELP = {
     "diceFp": "Dice joins × 0.2 FP.",
     "lootFp": "Lootbox spins × ($2 / FP_USD snapshot).",
     "passFp": "Monthly passes bought × ($15 / FP_USD snapshot).",
-    "burnFpSum": "Sum of shroomFp + shieldFp + otherShopFp + diceFp + lootFp + passFp. Not a separate source.",
+    "burnFpSum": "Sum of shroomFp + shieldFp + otherShopFp + diceFp + lootFp + passFp. Not a separate source. Does not include beerFp.",
 }
 
 DEFAULT_MULT = {
@@ -64,6 +78,7 @@ DEFAULT_MULT = {
     "diceFp": 1.0,
     "lootFp": 1.0,
     "passFp": 1.0,
+    "beerFp": 1.0,  # V1 beer consumed FP; not part of burnFpSum
 }
 
 MODE_OPTIONS = ["site", "site_blend", "custom", "manual"]
@@ -101,6 +116,98 @@ def save_burns(data: dict) -> None:
     BURNS_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(BURNS_JSON, "w", encoding="utf-8") as f:
         json.dump(data, f)
+
+
+def _header_map(fieldnames: list[str] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for h in fieldnames or []:
+        key = str(h).strip().strip('"').lower()
+        out[key] = h
+    return out
+
+
+def _beer_pair_from_count_fp(count_raw, fp_raw) -> tuple[int, float]:
+    try:
+        count = int(float(count_raw or 0))
+    except (TypeError, ValueError):
+        count = 0
+    if count < 0:
+        count = 0
+    if fp_raw is None or str(fp_raw).strip() == "":
+        fp = float(count) * V1_BEER_LIST_FP
+    else:
+        try:
+            fp = float(fp_raw)
+        except (TypeError, ValueError):
+            fp = float(count) * V1_BEER_LIST_FP
+    if fp < 0:
+        fp = 0.0
+    return count, round(fp, 6)
+
+
+def load_v1_beer() -> dict[str, tuple[int, float]]:
+    """Lowercase wallet → (beerCount, beerFp) from the precomputed V1 export.
+
+    Prefer the CSV beer count/FP columns. If those columns are absent, use
+    JSON `byItem.beer` (item id 5). Wallets missing from the file are 0.
+    Contract is V1 only (0x85b1…f1c3). Does not touch burnFpSum.
+    """
+    out: dict[str, tuple[int, float]] = {}
+    if V1_BURNS_CSV.exists():
+        with open(V1_BURNS_CSV, encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            headers = _header_map(reader.fieldnames)
+            wallet_key = headers.get("wallet")
+            count_key = next(
+                (orig for norm, orig in headers.items() if "beer" in norm and "count" in norm),
+                None,
+            )
+            fp_key = next(
+                (orig for norm, orig in headers.items() if "beer" in norm and "fp" in norm),
+                None,
+            )
+            if count_key or fp_key:
+                for row in reader:
+                    addr = str(row.get(wallet_key or "wallet") or "").strip()
+                    if not addr:
+                        continue
+                    count, fp = _beer_pair_from_count_fp(
+                        row.get(count_key) if count_key else None,
+                        row.get(fp_key) if fp_key else None,
+                    )
+                    if count_key is None:
+                        count = int(round(fp / V1_BEER_LIST_FP)) if V1_BEER_LIST_FP else 0
+                    out[addr.lower()] = (count, fp)
+                return out
+    if V1_BURNS_JSON.exists():
+        with open(V1_BURNS_JSON, encoding="utf-8") as f:
+            payload = json.load(f)
+        rows = []
+        if isinstance(payload, dict):
+            top = payload.get("top") or []
+            if isinstance(top, list):
+                rows.extend(top)
+            # Any other list of wallet objects with byItem.
+            for val in payload.values():
+                if isinstance(val, list) and val is not top:
+                    rows.extend(x for x in val if isinstance(x, dict) and "wallet" in x)
+        elif isinstance(payload, list):
+            rows = payload
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            addr = str(row.get("wallet") or "").strip()
+            if not addr:
+                continue
+            by = row.get("byItem") or {}
+            if not isinstance(by, dict):
+                by = {}
+            beer = by.get("beer") or by.get("Beer") or by.get("5") or {}
+            if not isinstance(beer, dict):
+                beer = {}
+            count, fp = _beer_pair_from_count_fp(beer.get("count"), beer.get("fp"))
+            out[addr.lower()] = (count, fp)
+    return out
 
 
 def fetch_remote(timeout: float = 20.0) -> dict:
@@ -405,7 +512,10 @@ def fetch_burns_for_whitelist(whitelist: dict, max_workers: int = 10) -> dict:
             "Wheel/gacha treated as free (no FP in docs). "
             "Scans consumeds itemIds 0–"
             f"{CONSUMED_ITEM_ID_SCAN_MAX}; unknown ids listed in unpriced* (not summed). "
-            "V1 foods (beer/apple/tea/…) are not distinct itemIds in api.pet.game."
+            "V1 beer is a separate beerCount/beerFp column (contract "
+            + V1_BEER_CONTRACT
+            + " only, Aug–Sep 2023); it is not added to burnFpSum. "
+            "Other V1 foods are not distinct itemIds in api.pet.game."
         ),
         "updatedAt": int(time.time()),
         "walletCount": len(burns),
@@ -497,6 +607,7 @@ def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
     burns_meta = burns_meta or {}
     feeds_map = burns_meta.get("mushroomFeeds") or {}
     bd_map = burns_meta.get("breakdown") or {}
+    beer_map = load_v1_beer()
     rows = []
     for w in data.get("wallets", []):
         addr = w["wallet"]
@@ -504,6 +615,7 @@ def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
         if not isinstance(detail, dict):
             detail = {}
         actions = burn_action_fps(detail)
+        beer_count, beer_fp = beer_map.get(str(addr).lower(), (0, 0.0))
         rows.append(
             {
                 "wallet": addr,
@@ -517,6 +629,8 @@ def wallets_df(data: dict, burns_meta: dict | None = None) -> pd.DataFrame:
                 "stars": float(w.get("stars") or 0),
                 "alivePetCount": float(w.get("alivePetCount") or 0),
                 **actions,
+                BEER_COUNT_COL: int(beer_count),
+                BEER_FP_COL: float(beer_fp),
                 "mushroomFeeds": float(_map_lookup(feeds_map, addr, 0) or 0),
             }
         )
@@ -545,6 +659,9 @@ def custom_weights(df: pd.DataFrame, mult: dict, lootbox_as_fp: bool, fp_usd: fl
     for col in BURN_FP_COLUMNS:
         series = df[col] if col in df.columns else 0.0
         w = w + series * float(mult.get(col, 0.0))
+    # beerFp is weighted on its own and is NOT part of burnFpSum.
+    beer_series = df[BEER_FP_COL] if BEER_FP_COL in df.columns else 0.0
+    w = w + beer_series * float(mult.get(BEER_FP_COL, DEFAULT_MULT[BEER_FP_COL]))
     return w.clip(lower=0)
 
 
@@ -908,7 +1025,8 @@ st.caption(
     "Simulation only — **not** an official airdrop. "
     "Score blurb: staked FP per alive pet; shields 6 FP × 2x; lootboxes $1.50 × 2x; "
     "dice 0.5x; age 0.1x; stars 0.1x. "
-    "**Seeds lock the formula/knobs; whitelist/score snapshots may drift.**"
+    "**Seeds lock the formula/knobs; whitelist/score snapshots may drift.** "
+    "Beer consumed is V1-only (Aug–Sep 2023) and is not inside burnFpSum."
 )
 
 # Load whitelist early so seed apply can align manual maps
@@ -1088,12 +1206,20 @@ else:
         f"(FP_USD≈{burns_meta.get('fpUsd')}; updatedAt={burns_updated}). "
         f"{burns_meta.get('walletsWithBurns', len(df) - zero_burns)} wallets with spend; "
         f"{zero_burns} at 0. "
-        "Stake upgrades / `pet.fpSpent` / `stakedFp` are **not** burns."
+        "Stake upgrades / `pet.fpSpent` / `stakedFp` are **not** burns. "
+        "Beer consumed is **not** part of burnFpSum."
     )
 
 burn_metric_cols = st.columns(len(BURN_FP_COLUMNS))
 for i, col in enumerate(BURN_FP_COLUMNS):
     burn_metric_cols[i].metric(col, f"{df[col].sum():,.1f}", help=BURN_COLUMN_HELP[col])
+
+_beer_n = int((df[BEER_COUNT_COL] > 0).sum())
+st.caption(
+    f"**Beer consumed** — {int(df[BEER_COUNT_COL].sum()):,} beers, "
+    f"{df[BEER_FP_COL].sum():,.0f} FP, {_beer_n} whitelist wallets with beerCount > 0. "
+    f"{BEER_NOTE} Custom weights scale `beerFp` on its own (default 1.0)."
+)
 
 st.divider()
 
@@ -1128,7 +1254,8 @@ elif mode == "site_blend":
         "(shroomFp + shieldFp + otherShopFp + diceFp + lootFp + passFp). "
         "`weight = score × scoreMult + burnFpSum × burnMult`. "
         "burnFpSum is only the sum of those columns. "
-        "To weight each burn action differently, use **Custom component weights**."
+        "To weight each burn action differently, use **Custom component weights**. "
+        "Beer consumed (`beerFp`) is not in this blend."
     )
     entering_blend = st.session_state.get("_prev_weight_mode") != "site_blend"
     force_blend = entering_blend or bool(st.session_state.pop("_hydrate_blend", False))
@@ -1143,7 +1270,7 @@ elif mode == "site_blend":
             step=0.1,
             format="%.4f",
             key="blend_burn_mult",
-            help="Multiplies the sum of shroom/shield/other shop/dice/loot/pass FP. Not stake/fpSpent.",
+            help="Multiplies the sum of shroom/shield/other shop/dice/loot/pass FP. Not stake/fpSpent. Does not include V1 beer.",
         )
     st.session_state["saved_blend_score"] = float(blend_score)
     st.session_state["saved_blend_burn"] = float(blend_burn)
@@ -1212,7 +1339,8 @@ elif mode == "custom":
         )
     st.markdown(
         "**FP burn actions** — weighted independently. "
-        "Not stake upgrades. The table's `burnFpSum` is only these six columns added together."
+        "Not stake upgrades. The table's `burnFpSum` is only these six columns added together. "
+        "Beer consumed is separate and is not added into that sum."
     )
     bc1, bc2, bc3 = st.columns(3)
     burn_inputs: dict[str, float] = {}
@@ -1227,6 +1355,14 @@ elif mode == "custom":
                 key=f"mult_{col}",
                 help=BURN_COLUMN_HELP[col],
             )
+    m_beer = st.number_input(
+        "beer consumed (beerFp) ×",
+        min_value=0.0,
+        step=0.1,
+        format="%.4f",
+        key="mult_beerFp",
+        help=BEER_NOTE + " Weight multiplies FP paid for V1 beer, not beerCount, and not burnFpSum. Default 1.0.",
+    )
 
     lootbox_as_fp = st.checkbox(
         "Convert lootbox USD face → FP using FP USD price",
@@ -1254,6 +1390,7 @@ elif mode == "custom":
         "longestPetAliveDays": float(m_age),
         "stars": float(m_stars),
         **{col: float(burn_inputs[col]) for col in BURN_FP_COLUMNS},
+        BEER_FP_COL: float(m_beer),
     }
     # Persist so leaving custom mode does not lose multipliers to widget teardown
     st.session_state["saved_mult"] = dict(mult)
@@ -1301,7 +1438,17 @@ st.session_state["_prev_weight_mode"] = mode
 # Build allocation
 alloc = allocate(weights, float(total_pool), dist_method)
 out = df[
-    ["wallet", "rank", "score", *BURN_FP_COLUMNS, BURN_FP_SUM_COL, "mushroomFeeds", "stakedFp"]
+    [
+        "wallet",
+        "rank",
+        "score",
+        *BURN_FP_COLUMNS,
+        BURN_FP_SUM_COL,
+        BEER_COUNT_COL,
+        BEER_FP_COL,
+        "mushroomFeeds",
+        "stakedFp",
+    ]
 ].copy()
 out["weight"] = weights.values
 wsum = float(out["weight"].sum())
@@ -1391,6 +1538,8 @@ fig_bar = px.bar(
         "diceFp": ":.2f",
         "lootFp": ":.2f",
         "passFp": ":.2f",
+        "beerCount": True,
+        "beerFp": ":.2f",
         "mushroomFeeds": True,
         "imd": ":.2f",
         "label": False,
@@ -1418,8 +1567,9 @@ st.subheader("Full allocation")
 display = out.copy()
 display["weight"] = display["weight"].map(lambda v: round(float(v), 6))
 display["weight_pct"] = display["weight_pct"].map(lambda v: round(float(v), 6))
-for _col in (*BURN_FP_COLUMNS, BURN_FP_SUM_COL):
+for _col in (*BURN_FP_COLUMNS, BURN_FP_SUM_COL, BEER_FP_COL):
     display[_col] = display[_col].map(lambda v: round(float(v), 6))
+display[BEER_COUNT_COL] = display[BEER_COUNT_COL].map(lambda v: int(float(v)))
 display["mushroomFeeds"] = display["mushroomFeeds"].map(lambda v: int(float(v)))
 display["stakedFp"] = display["stakedFp"].map(lambda v: round(float(v), 6))
 display["imd"] = display["imd"].map(lambda v: round(float(v), 6))
@@ -1448,6 +1598,16 @@ st.dataframe(
             col: st.column_config.NumberColumn(col, help=BURN_COLUMN_HELP[col], format="%.4f")
             for col in (*BURN_FP_COLUMNS, BURN_FP_SUM_COL)
         },
+        BEER_COUNT_COL: st.column_config.NumberColumn(
+            "beer consumed",
+            help=BEER_NOTE + " Count of V1 item id 5 buys. 0 if the wallet has no V1 beer.",
+            format="%d",
+        ),
+        BEER_FP_COL: st.column_config.NumberColumn(
+            "beer consumed FP",
+            help=BEER_NOTE + " FP actually paid (50 FP × count). Separate from burnFpSum.",
+            format="%.4f",
+        ),
     },
 )
 
@@ -1470,7 +1630,16 @@ with st.expander("Compare alternate methods (same weights)"):
     st.dataframe(cmp.head(25), use_container_width=True)
 
 with st.expander("Top burners vs top score (glance)"):
-    glance_cols = ["wallet", "score", *BURN_FP_COLUMNS, BURN_FP_SUM_COL, "mushroomFeeds", "stakedFp"]
+    glance_cols = [
+        "wallet",
+        "score",
+        *BURN_FP_COLUMNS,
+        BURN_FP_SUM_COL,
+        BEER_COUNT_COL,
+        BEER_FP_COL,
+        "mushroomFeeds",
+        "stakedFp",
+    ]
     glance = df[glance_cols].copy()
     c_a, c_b = st.columns(2)
     with c_a:

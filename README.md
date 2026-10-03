@@ -27,7 +27,7 @@ Then open http://localhost:8501 (or the host URL if remote).
 - Weight modes:
   - **Site score** — use each wallet's Analytica `score`
   - **Site score + burns blend** — `score × m1 + burnFpSum × m2` (`burnFpSum` = shroom + shield + other shop + dice + loot + pass; not a separate source)
-  - **Custom component weights** — site-style multipliers (staked FP, shields, lootboxes, dice, age, stars) plus an independent multiplier for each burn column: `shroomFp`, `shieldFp`, `otherShopFp`, `diceFp`, `lootFp`, `passFp`
+  - **Custom component weights** — site-style multipliers (staked FP, shields, lootboxes, dice, age, stars) plus an independent multiplier for each burn column: `shroomFp`, `shieldFp`, `otherShopFp`, `diceFp`, `lootFp`, `passFp`, and `beerFp` (V1 beer consumed, default 1.0, **not** inside `burnFpSum`)
   - **Manual override** — edit per-wallet weights in a table
 - Distribution methods: pro-rata, equal split, sqrt(weight)
 - Summary metrics (Gini, HHI, top-10 share, min/median/max)
@@ -35,7 +35,8 @@ Then open http://localhost:8501 (or the host URL if remote).
 - Refresh button re-fetches whitelist **and** per-action FP burns (`fp-burns.json` sidecar)
 - **Shareable seeds** (`imd1.` + zlib/base64url JSON): copy/load formula knobs; optional `?seed=` URL. Seeds lock the formula; whitelist data may drift.
 - Burns are **separate columns**, not one `lifetimeFpBurned` total: `shroomFp` (shop Shroom), `shieldFp` (shop shields), `otherShopFp` (insurance + cosmetics), `diceFp` (×0.2), `lootFp` ($2/FP_USD), `passFp` ($15/FP_USD). `burnFpSum` is only those columns added together. Stake upgrades (items 1–5) and `pet.fpSpent`/`stakedFp` are excluded. Prices are the existing catalog / unit costs — nothing new. CSV includes every column.
-- **Historical foods (beer/apple/tea/…):** secondary guides (Odaily Nov 2023) list V1-era foods (beer 50 FP, etc.). On `api.pet.game`, every `isSell:false` consumed maps to catalog itemIds **0–21** only (no orphan ids; no Beer/Apple/Tea item names). Those V1 foods are **not** includable from this API without inventing itemId↔price maps, so they are not added to the burn sum. Fetch scans itemIds 0–64 and records any future unpriced ids in `fp-burns.json` (`unpricedItemIds` / `unpricedGlobalBuys`).
+- **Beer consumed** (`beerCount`, `beerFp`): V1 contract only (`0x85b157ebaaf289de5301ae6694b651bf3b8df1c3`), Aug–Sep 2023 foods (item id 5, 50 FP, FP actually paid in `v1-out/fp_v1_burns.csv`). Later diamond buys are **not** in this column. `beerFp` is **not** added to `burnFpSum` (beer is already a V1 burn and must not be double-counted into the shop columns). Custom weights can weight `beerFp` on its own (default 1.0). Wallets with no V1 beer are 0. CSV export includes both columns. UI label: beer consumed.
+- **Other historical foods (apple/tea/…):** secondary guides (Odaily Nov 2023) list more V1-era foods. On `api.pet.game`, every `isSell:false` consumed maps to catalog itemIds **0–21** only (no orphan ids; no Beer/Apple/Tea item names). Those other V1 foods are **not** includable from this API without inventing itemId↔price maps, so they are not added to the burn sum. Fetch scans itemIds 0–64 and records any future unpriced ids in `fp-burns.json` (`unpricedItemIds` / `unpricedGlobalBuys`).
 
 ## Verify allocation math
 
